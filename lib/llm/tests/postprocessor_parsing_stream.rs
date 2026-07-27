@@ -3641,11 +3641,8 @@ async fn all_unified_families_honor_normalized_request_controls_for_all_selector
                         .postprocessor_parsing_stream(input, &request, false, false)
                         .unwrap();
                     let out = drain_stream(output).await;
-                    let disabled = if family == "gemma4" {
-                        thinking != Some(true)
-                    } else {
-                        thinking == Some(false)
-                    };
+                    // Scicom: gemma4's parser is never gated on enable_thinking.
+                    let disabled = family != "gemma4" && thinking == Some(false);
                     assert_eq!(
                         out.reasoning,
                         if disabled { "" } else { "private" },
@@ -3653,9 +3650,7 @@ async fn all_unified_families_honor_normalized_request_controls_for_all_selector
                     );
                     assert_eq!(
                         out.content,
-                        if disabled && family == "gemma4" {
-                            raw
-                        } else if disabled {
+                        if disabled {
                             "privateanswer"
                         } else {
                             "answer"
@@ -3668,8 +3663,11 @@ async fn all_unified_families_honor_normalized_request_controls_for_all_selector
     }
 }
 
+/// Gemma 4's reasoning parser is not gated on enable_thinking: on a turn that ends
+/// in a tool response with thinking off, the model writes the channel delimiters
+/// itself, and leaving them in `content` exposes them to the caller.
 #[tokio::test]
-async fn gemma4_without_enable_thinking_keeps_parser_markers_as_content() {
+async fn gemma4_without_enable_thinking_still_parses_channel_markers() {
     for (reasoning_selector, tool_selector) in [
         (Some("gemma4"), None),
         (None, Some("gemma4")),
@@ -3705,11 +3703,8 @@ async fn gemma4_without_enable_thinking_keeps_parser_markers_as_content() {
             reasoning, content, ..
         } = drain_stream(output_stream).await;
 
-        assert!(
-            reasoning.is_empty(),
-            "Gemma 4 reasoning parser must be gated off without enable_thinking=true, got: {reasoning:?}"
-        );
-        assert_eq!(content, text);
+        assert_eq!(reasoning, "should stay plain");
+        assert_eq!(content, "final answer");
     }
 }
 
