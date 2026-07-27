@@ -244,7 +244,24 @@ class StreamingPostProcessor:
         # `enable_thinking` is the convention adopted across the modern
         # reasoning-capable model families that vLLM supports; templates
         # that don't honor it simply leave it unset (no effect here).
-        thinking_disabled = chat_template_kwargs.get("enable_thinking") is False
+        # Gemma 4 is exempt from that gate. Its canonical chat template only
+        # prefills a closed `<|channel>thought\n<channel|>` when the previous
+        # message is neither a tool_response nor a tool_call; on a turn ending
+        # in a tool response with enable_thinking=False the template emits
+        # nothing and the model produces the delimiters itself. Special tokens
+        # are already preserved for gemma4, so skipping the parser leaves them
+        # with nothing to consume them and they land in `content`
+        # (200/200 on google/gemma-4-31B-it). Keeping it enabled is a no-op
+        # when the markers really are absent, because
+        # Gemma4ReasoningParser.extract_reasoning returns (None, model_output)
+        # in that case -- which is why upstream vLLM never gates on
+        # enable_thinking at all.
+        gemma4_like = "gemma4" in getattr(
+            reasoning_parser_class, "__name__", ""
+        ).lower()
+        thinking_disabled = (
+            not gemma4_like and chat_template_kwargs.get("enable_thinking") is False
+        )
         self.reasoning_parser = (
             reasoning_parser_class(
                 tokenizer,

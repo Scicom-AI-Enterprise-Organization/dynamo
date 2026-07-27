@@ -2696,10 +2696,39 @@ impl OpenAIPreprocessor {
                 false
             }
             Some("gemma4") | Some("gemma-4") => {
-                if let Some(enabled) = dynamo_renderer::thinking_bool_from_args(chat_template_args)
-                {
-                    return !enabled;
-                }
+                // Deliberately NOT gated on enable_thinking.
+                //
+                // The premise for gating -- that with enable_thinking=false the
+                // model emits no `<|channel>` markers -- does not hold for the
+                // canonical Gemma 4 chat template. Its `add_generation_prompt`
+                // block only prefills a closed thought channel on the branch
+                // where the previous message is neither a tool_response nor a
+                // tool_call:
+                //
+                //   {%- if ns.prev_message_type != 'tool_response'
+                //          and ns.prev_message_type != 'tool_call' -%}
+                //       {{- '<|turn>model\n' -}}
+                //       {%- if not enable_thinking -%}
+                //           {{- '<|channel>thought\n<channel|>' -}}
+                //
+                // On a turn that ends in a tool response with enable_thinking
+                // false, both arms are skipped, the template emits nothing, and
+                // the model produces `<|channel>thought\n<channel|>` itself.
+                // parser_requires_special_tokens() has already forced
+                // skip_special_tokens=false for gemma4, so disabling the parser
+                // here leaves those delimiters with nothing to consume them and
+                // they surface in `content`. Measured 200/200 on
+                // google/gemma-4-31B-it with a billing tool-response turn.
+                //
+                // Leaving the parser enabled is safe in the opposite case:
+                // Gemma4ReasoningParser::extract_reasoning returns
+                // (None, model_output) when neither delimiter is present, so
+                // when thinking really is off it is a no-op. This matches
+                // upstream vLLM, which never gates its reasoning parser on
+                // enable_thinking (vllm/entrypoints/serve/render/serving.py).
+                //
+                // See https://github.com/ai-dynamo/dynamo/issues/8636 for the
+                // gating rationale that still applies to the other families.
                 false
             }
             Some("minimax_m3") | Some("minimax-m3") => {
