@@ -3235,8 +3235,11 @@ async fn response_format_gemma4_bare_json_stays_content() {
     assert_eq!(content, json);
 }
 
+/// Gemma 4's reasoning parser is not gated on enable_thinking: on a turn that ends
+/// in a tool response with thinking off, the model writes the channel delimiters
+/// itself, and leaving them in `content` exposes them to the caller.
 #[tokio::test]
-async fn gemma4_without_enable_thinking_keeps_parser_markers_as_content() {
+async fn gemma4_without_enable_thinking_still_parses_channel_markers() {
     let preprocessor = build_preprocessor(Some("gemma4"), None);
 
     let request: NvCreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
@@ -3266,11 +3269,8 @@ async fn gemma4_without_enable_thinking_keeps_parser_markers_as_content() {
         reasoning, content, ..
     } = drain_stream(output_stream).await;
 
-    assert!(
-        reasoning.is_empty(),
-        "Gemma 4 reasoning parser must be gated off without enable_thinking=true, got: {reasoning:?}"
-    );
-    assert_eq!(content, text);
+    assert_eq!(reasoning, "should stay plain");
+    assert_eq!(content, "final answer");
 }
 
 /// MiniMax append-think is a force-reasoning parser that is not yet proven to

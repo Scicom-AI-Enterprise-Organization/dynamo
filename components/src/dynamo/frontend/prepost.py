@@ -441,9 +441,19 @@ def _reasoning_parser_enabled(
     half: when the chat template runs with enable_thinking=False the reasoning
     tags live in the prompt and the generated output carries none.
     """
-    return reasoning_parser_class is not None and (
-        chat_template_kwargs.get("enable_thinking") is not False
-    )
+    if reasoning_parser_class is None:
+        return False
+    # Gemma 4 is exempt from the enable_thinking gate. Its canonical chat template
+    # only prefills a closed `<|channel>thought\n<channel|>` when the previous
+    # message is neither a tool_response nor a tool_call; on a turn ending in a
+    # tool response with enable_thinking=False the template emits nothing and the
+    # model produces the delimiters itself. Special tokens are preserved for
+    # gemma4, so skipping the parser leaves them in `content` (200/200 on
+    # google/gemma-4-31B-it). Keeping it enabled is a no-op when the markers are
+    # absent, which is why upstream vLLM never gates on enable_thinking at all.
+    if "gemma4" in getattr(reasoning_parser_class, "__name__", "").lower():
+        return True
+    return chat_template_kwargs.get("enable_thinking") is not False
 
 
 def _prepare_request(
