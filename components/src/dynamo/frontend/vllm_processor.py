@@ -167,6 +167,37 @@ def _build_reasoning_parser_metadata(
     return reasoning_parser.is_reasoning_end(prompt_token_ids), parser_kwargs
 
 
+def _guided_decoding_from_sampling_params(sp: Any) -> dict[str, Any] | None:
+    """Map vLLM's SamplingParams.structured_outputs to Dynamo's guided_decoding.
+
+    Returns None when the request asked for no constraint, so the key stays
+    absent and the worker's `is not None` check short-circuits exactly as before.
+
+    `json_object` has no counterpart in Dynamo's guided_decoding, so
+    response_format={"type": "json_object"} is expressed as the equivalent
+    permissive schema; without this it would be dropped and the request would
+    fall back to unconstrained decoding, which is the failure being fixed.
+    """
+    so = getattr(sp, "structured_outputs", None)
+    if so is None:
+        return None
+
+    guided: dict[str, Any] = {}
+    for field in ("json", "regex", "choice", "grammar", "whitespace_pattern"):
+        value = getattr(so, field, None)
+        if value is not None:
+            guided[field] = value
+
+    structural_tag = getattr(so, "structural_tag", None)
+    if structural_tag is not None:
+        guided["structural_tag"] = structural_tag
+
+    if "json" not in guided and getattr(so, "json_object", None):
+        guided["json"] = {"type": "object"}
+
+    return guided or None
+
+
 def _inject_routing_metadata(
     dynamo_preproc: dict[str, Any],
     target: dict[str, Any],
@@ -528,6 +559,18 @@ class VllmProcessor:
                 "top_p": sp.top_p,
                 "top_k": sp.top_k,
                 "min_p": sp.min_p,
+                # Structured outputs must be copied across explicitly: this dict
+                # is a whitelist, so anything not named here is silently dropped
+                # on the way to the worker. vLLM has already parsed
+                # response_format / structured_outputs into sp.structured_outputs
+                # by this point, and the worker knows how to rebuild a
+                # StructuredOutputsParams from sampling_options["guided_decoding"]
+                # (components/src/dynamo/vllm/handlers.py) -- the two ends were
+                # simply never connected on this path. Without this, guided_json,
+                # guided_choice, guided_regex and response_format are all accepted
+                # with 200 OK and ignored, so a caller asking for raw JSON gets a
+                # ```json fence and json.loads() throws.
+                "guided_decoding": _guided_decoding_from_sampling_params(sp),
                 "seed": sp.seed,
             },
             "output_options": {
