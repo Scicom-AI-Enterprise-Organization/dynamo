@@ -60,6 +60,48 @@ async fn echo_request_id_header(
     response
 }
 
+/// `x-time-deployment`, populated from the `TIME_DEPLOYMENT` environment
+/// variable at process start.
+///
+/// This exists so a caller can tell which build answered, without shell access
+/// to the box. The frontend is launched from a Slurm job whose binary is
+/// rebuilt out of band, so "which code is serving me" is otherwise invisible
+/// over HTTP -- and a stale binary fails silently rather than loudly.
+///
+/// Read once: env lookups are cheap but this sits on every response, and the
+/// value cannot change without restarting the process anyway. Invalid header
+/// values (non-ASCII, control chars) are dropped rather than panicking, so a
+/// bad env var degrades to "no header" instead of taking the service down.
+static TIME_DEPLOYMENT_HEADER: std::sync::OnceLock<Option<axum::http::HeaderValue>> =
+    std::sync::OnceLock::new();
+
+fn time_deployment_header() -> Option<&'static axum::http::HeaderValue> {
+    TIME_DEPLOYMENT_HEADER
+        .get_or_init(|| {
+            std::env::var("TIME_DEPLOYMENT")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .and_then(|v| axum::http::HeaderValue::from_str(&v).ok())
+        })
+        .as_ref()
+}
+
+/// Middleware that stamps `x-time-deployment` onto every response when
+/// `TIME_DEPLOYMENT` is set. No-op when it is unset, so this is inert for
+/// anyone who does not opt in.
+async fn add_time_deployment_header(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut response = next.run(request).await;
+    if let Some(value) = time_deployment_header() {
+        response
+            .headers_mut()
+            .insert("x-time-deployment", value.clone());
+    }
+    response
+}
+
 async fn track_inflight_inference(
     axum::extract::State(state): axum::extract::State<Arc<State>>,
     request: axum::extract::Request,
@@ -1066,6 +1108,10 @@ impl HttpServiceConfigBuilder {
 
         // Echo x-request-id from request to response headers for client correlation
         let router = router.layer(axum::middleware::from_fn(echo_request_id_header));
+
+        // Stamp x-time-deployment from the TIME_DEPLOYMENT env var, so callers can
+        // identify which build served them. No-op when the var is unset.
+        let router = router.layer(axum::middleware::from_fn(add_time_deployment_header));
 
         let enable_rl_router = config.enable_rl || env_is_truthy("DYN_ENABLE_RL");
         let rl_router = if enable_rl_router {
