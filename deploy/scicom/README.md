@@ -1,10 +1,14 @@
 # Scicom tm-h20 deployment notes
 
+> Full per-commit history, including **defect 3** (tool-turn reasoning leak with
+> `enable_thinking=true`, fixed 2026-07-30/31), is in
+> [`DEPLOYMENT_CHANGELOG.md`](DEPLOYMENT_CHANGELOG.md).
+
 What this branch changes versus upstream `ai-dynamo/dynamo@39c7bcb`, why, and how
 to reproduce it. Everything here was measured on tm-h20 (2 × 8× H20-3e, Slurm,
 `google/gemma-4-31B-it` FP8, 1P1D TP8 disagg with KV over RoCE).
 
-## The two defects
+## The three defects
 
 ### 1. gemma4 `<|channel>` delimiters leak into `content`
 
@@ -58,6 +62,13 @@ the Rust path is the one actually deployed.
 **untested** on this path — do not assume it works.
 
 ## Verified on job 300 (public endpoint, n=10/cell, temp=0.7 top_p=0.95)
+
+> **Detector caveat (added 2026-07-31).** The `channel leak` rows below are a
+> grep for `<|channel>` markers in `content`. That is the right check for defect
+> 1, but it is **blind to defect 3**, which leaks the same reasoning with no
+> markers at all — so a `0/10` here does not imply a clean reasoning path. Assert
+> `reasoning_content` is populated when thinking is requested instead. See
+> `DEPLOYMENT_CHANGELOG.md`.
 
 | check | result |
 |---|---|
