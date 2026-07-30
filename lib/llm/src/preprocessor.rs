@@ -167,6 +167,11 @@ where
     attach_metrics_annotation(response, &metrics);
 }
 
+/// Gemma 4's reasoning opener, replayed into the parser when the chat template
+/// left it dangling at the end of the prompt. Must match START_TOKEN plus the
+/// `thought\n` role label used by dynamo-parsers' Gemma4ReasoningParser.
+const GEMMA4_INJECTED_OPENER: &str = "<|channel>thought\n";
+
 // Reasoning State for reasoning parsing transformation step
 struct ReasoningState {
     stream: Pin<Box<dyn Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send>>,
@@ -2818,6 +2823,29 @@ impl OpenAIPreprocessor {
 
         if prompt_injected_reasoning {
             reasoning_parser.set_in_reasoning(true);
+            // set_in_reasoning is a no-op for gemma4: ReasoningParser provides a
+            // default empty body ("for parsers that don't support per-request
+            // overrides") and Gemma4ReasoningParser implements only
+            // detect_and_parse_reasoning / parse_reasoning_streaming_incremental /
+            // finish_reasoning_stream, so it never overrides the setter. The call
+            // above therefore cannot arm it, and every token of a tool-response
+            // turn's chain-of-thought would be emitted as user-visible content.
+            //
+            // Prime it instead by replaying the opener the chat template already
+            // put at the end of the prompt. The parser finds START_TOKEN at
+            // offset 0, enters the reasoning span, and consumes the `thought\n`
+            // role label, so the model's first real delta -- which begins mid
+            // chain-of-thought with no marker of its own -- is classified as
+            // reasoning and the span closes normally on `<channel|>`.
+            //
+            // The synthetic chunk's result is discarded on purpose: it carries no
+            // model output, only parser state. Priming is safe because
+            // prompt_injected_reasoning is only true when the prompt really does
+            // end with that opener (see prompt_injected_reasoning_start).
+            if matches!(parser_name.as_str(), "gemma4" | "gemma-4") {
+                let _ = reasoning_parser
+                    .parse_reasoning_streaming_incremental(GEMMA4_INJECTED_OPENER, &[]);
+            }
         }
 
         let state = ReasoningState {
