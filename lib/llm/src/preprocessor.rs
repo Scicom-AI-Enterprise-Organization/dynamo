@@ -6062,6 +6062,39 @@ impl OpenAIPreprocessor {
         match reasoning_parser {
             Some("minimax_m3") | Some("minimax-m3") => prompt.ends_with("<mm:think>"),
             Some("kimi_k3") | Some("kimi-k3") => prompt.ends_with("<|open|>think<|sep|>"),
+            // Gemma 4 has no `<think>`; its opener is `<|channel>thought`. On a turn
+            // whose previous message is a tool response, and only when thinking is on,
+            // the canonical template appends that opener WITHOUT its `<channel|>` close:
+            //
+            //   {%- if add_generation_prompt -%}
+            //     {%- if ns.prev_message_type != 'tool_response'
+            //            and ns.prev_message_type != 'tool_call' -%}
+            //       {{- '<|turn>model\n' -}}
+            //       {%- if not enable_thinking -%}
+            //         {{- '<|channel>thought\n<channel|>' -}}
+            //       {%- endif -%}
+            //     {%- elif ns.prev_message_type == 'tool_response' and enable_thinking -%}
+            //       {{- '<|channel>thought\n' -}}          <-- open, unclosed
+            //     {%- endif -%}
+            //   {%- endif -%}
+            //
+            // So the completion begins INSIDE the thought channel and emits no start
+            // tag of its own -- it just reasons, closes with `<channel|>`, then answers.
+            // Without this arm the parser never enters reasoning mode, `<channel|>` is
+            // consumed as an ordinary special token, and the entire scratchpad is
+            // concatenated into user-visible `content` with no delimiter left to split
+            // on. Measured on google/gemma-4-31B-it: reasoning_content populated 0/200
+            // across four tool-response studies, against 200/200 on plain vLLM
+            // (`--reasoning-parser gemma4`) with the same model and payloads; plain
+            // turns are 50/50 on both, so only this template branch is affected.
+            //
+            // Distinct from the enable_thinking=false leak fixed in 96f170d87: there the
+            // model emits both delimiters and the parser was disabled; here the parser is
+            // enabled but never sees an opener. Both paths are needed.
+            //
+            // The pattern deliberately omits the trailing newline -- `prompt` was
+            // trim_end()'d above, so `"<|channel>thought\n"` would never match.
+            Some("gemma4") | Some("gemma-4") => prompt.ends_with("<|channel>thought"),
             _ => prompt.ends_with("<think>"),
         }
     }
@@ -8799,6 +8832,42 @@ mod tests {
                 "legacy no-parser detection",
             ),
             (Some("minimax_m3"), None, false, "no prompt"),
+            // Gemma 4: tool-response turn with thinking on leaves the thought channel
+            // open, so the completion starts inside it with no start tag of its own.
+            (
+                Some("gemma4"),
+                Some("<|tool_response>...<tool_response|><|channel>thought\n"),
+                true,
+                "gemma4 tool-response turn opens an unclosed thought channel",
+            ),
+            (
+                Some("gemma-4"),
+                Some("<|tool_response>...<tool_response|><|channel>thought\n"),
+                true,
+                "gemma-4 alias behaves identically",
+            ),
+            // Plain turn, thinking on: template stops at `<|turn>model` and the model
+            // emits its own `<|channel>thought`, so the parser must NOT be pre-armed.
+            (
+                Some("gemma4"),
+                Some("<|turn>model\n"),
+                false,
+                "gemma4 plain turn is not prompt-injected",
+            ),
+            // Thinking off: the template closes the channel itself, so there is no
+            // reasoning to consume and the parser must not start inside one.
+            (
+                Some("gemma4"),
+                Some("<|turn>model\n<|channel>thought\n<channel|>"),
+                false,
+                "gemma4 pre-closed thought channel means not in reasoning",
+            ),
+            (
+                Some("gemma4"),
+                Some("...<think>\n"),
+                false,
+                "gemma4 must not use generic <think>",
+            ),
         ];
 
         for (parser, prompt, expected, desc) in cases {
