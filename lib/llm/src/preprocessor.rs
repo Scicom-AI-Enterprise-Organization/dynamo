@@ -6682,7 +6682,11 @@ impl OpenAIPreprocessor {
                     .rev()
                     .all(|c| suffix.next() == Some(c))
             }
-            Some("gemma4") => {
+            // Gemma 4 opens `<|channel>thought` without its `<channel|>` close on a turn
+            // after a tool response with thinking on, so the completion starts inside the
+            // thought channel. Upstream arms this itself now; the fork adds the `gemma-4`
+            // alias it has accepted since 1.3.0.
+            Some("gemma4") | Some("gemma-4") => {
                 prompt.ends_with("<|channel>thought") || prompt.ends_with("<|channel>")
             }
             Some("muse" | "muse_glimmer") => prompt.ends_with("assistant to=self<|message|>"),
@@ -12575,6 +12579,42 @@ mod tests {
                 "legacy no-parser detection",
             ),
             (Some("minimax_m3"), None, false, "no prompt"),
+            // Gemma 4: tool-response turn with thinking on leaves the thought channel
+            // open, so the completion starts inside it with no start tag of its own.
+            (
+                Some("gemma4"),
+                Some("<|tool_response>...<tool_response|><|channel>thought\n"),
+                true,
+                "gemma4 tool-response turn opens an unclosed thought channel",
+            ),
+            (
+                Some("gemma-4"),
+                Some("<|tool_response>...<tool_response|><|channel>thought\n"),
+                true,
+                "gemma-4 alias behaves identically",
+            ),
+            // Plain turn, thinking on: template stops at `<|turn>model` and the model
+            // emits its own `<|channel>thought`, so the parser must NOT be pre-armed.
+            (
+                Some("gemma4"),
+                Some("<|turn>model\n"),
+                false,
+                "gemma4 plain turn is not prompt-injected",
+            ),
+            // Thinking off: the template closes the channel itself, so there is no
+            // reasoning to consume and the parser must not start inside one.
+            (
+                Some("gemma4"),
+                Some("<|turn>model\n<|channel>thought\n<channel|>"),
+                false,
+                "gemma4 pre-closed thought channel means not in reasoning",
+            ),
+            (
+                Some("gemma4"),
+                Some("...<think>\n"),
+                false,
+                "gemma4 must not use generic <think>",
+            ),
         ];
 
         for (parser, prompt, expected, desc) in cases {
