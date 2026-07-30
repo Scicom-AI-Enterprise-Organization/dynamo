@@ -1911,3 +1911,97 @@ async fn tool_choice_matrix_immediate_jail_reasoning_only_first_chunk() {
     );
     assert_clean_tool_call(case, &content, &tool_calls, "San Francisco");
 }
+
+/// Gemma 4 leaves the thought channel OPEN in the prompt when
+/// `add_generation_prompt` runs after a tool response with thinking enabled:
+///
+///   {%- elif ns.prev_message_type == 'tool_response' and enable_thinking -%}
+///       {{- '<|channel>thought\n' -}}
+///
+/// so the completion starts INSIDE the channel and emits no start tag of its own.
+/// `prompt_injected_reasoning=true` must therefore route the leading text to
+/// `reasoning_content` and hand the client only what follows `<channel|>`.
+///
+/// This cannot be covered by asserting on `set_in_reasoning`: the trait supplies a
+/// default no-op body and `Gemma4ReasoningParser` never overrides it, so the flag
+/// alone changes nothing and the parser has to be primed instead. A regression
+/// here shows up as the whole chain-of-thought reaching the customer.
+async fn collect_reasoning_and_content(
+    chunks: Vec<&str>,
+    prompt_injected_reasoning: bool,
+) -> (String, String) {
+    // Build eagerly: the returned stream must be 'static, so nothing may borrow
+    // from `chunks` past this point.
+    let built: Vec<Annotated<NvCreateChatCompletionStreamResponse>> = chunks
+        .into_iter()
+        .map(mock_content_chunk)
+        .map(Annotated::from_data)
+        .collect();
+    let input = stream::iter(built);
+    let out: Vec<Annotated<NvCreateChatCompletionStreamResponse>> =
+        OpenAIPreprocessor::parse_reasoning_content_from_stream(
+            input,
+            "gemma4".to_string(),
+            prompt_injected_reasoning,
+        )
+        .collect()
+        .await;
+
+    let mut reasoning = String::new();
+    let mut content = String::new();
+    for chunk in out {
+        let Some(data) = chunk.data else { continue };
+        for choice in &data.inner.choices {
+            if let Some(r) = &choice.delta.reasoning_content {
+                reasoning.push_str(r);
+            }
+            if let Some(ChatCompletionMessageContent::Text(t)) = &choice.delta.content {
+                content.push_str(t);
+            }
+        }
+    }
+    (reasoning, content)
+}
+
+#[tokio::test]
+async fn gemma4_prompt_injected_reasoning_routes_leading_text_to_reasoning() {
+    // Exactly what the model emits on a tool-response turn: no opening marker,
+    // chain-of-thought, `<channel|>`, then the customer-facing reply.
+    let chunks = vec![
+        "The user is asking if they have any outstanding balance.\n",
+        "The tool returned RM 0.00. I need to say this warmly.",
+        "<channel|>",
+        "You're all clear! You have no outstanding balance.",
+    ];
+
+    let (reasoning, content) = collect_reasoning_and_content(chunks.clone(), true).await;
+
+    assert!(
+        reasoning.contains("outstanding balance"),
+        "chain-of-thought must land in reasoning_content, got: {reasoning:?}"
+    );
+    assert!(
+        !content.contains("I need to say this warmly"),
+        "deliberation must NOT reach the customer, got: {content:?}"
+    );
+    assert!(
+        content.contains("You're all clear!"),
+        "the reply after <channel|> must reach the customer, got: {content:?}"
+    );
+    assert!(
+        !content.contains("<channel|>"),
+        "the closing delimiter must be consumed, got: {content:?}"
+    );
+
+    // Control: without the flag the parser never enters the span, which is the
+    // pre-fix behaviour -- the whole scratchpad is emitted as visible content.
+    let (reasoning_off, content_off) = collect_reasoning_and_content(chunks, false).await;
+    assert!(
+        reasoning_off.is_empty(),
+        "no flag means no reasoning span, got: {reasoning_off:?}"
+    );
+    assert!(
+        content_off.contains("I need to say this warmly"),
+        "control case should reproduce the leak, got: {content_off:?}"
+    );
+}
