@@ -646,6 +646,11 @@ fn drain_deferred_reasoning(state: &mut ChoiceReasoningState) -> (Option<String>
     }
 }
 
+/// Gemma 4's reasoning opener, replayed into the parser when the chat template
+/// left it dangling at the end of the prompt. Must match START_TOKEN plus the
+/// `thought\n` role label used by dynamo-parsers' Gemma4ReasoningParser.
+const GEMMA4_INJECTED_OPENER: &str = "<|channel>thought\n";
+
 struct ReasoningState {
     stream: Pin<Box<dyn Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send>>,
     parser_name: String,
@@ -6305,6 +6310,29 @@ impl OpenAIPreprocessor {
                                         as Box<dyn ReasoningParser>;
                                 if prompt_injected_reasoning {
                                     parser.set_in_reasoning(true);
+                                    // set_in_reasoning is a no-op for gemma4:
+                                    // Gemma4ReasoningParser (dynamo-parsers, unchanged
+                                    // from 3.1.0 through 8.1.0) never overrides the
+                                    // trait's empty default, so the call above cannot
+                                    // arm it and a tool-response turn's whole
+                                    // chain-of-thought would reach `content`.
+                                    //
+                                    // Prime it instead by replaying the opener the chat
+                                    // template left at the end of the prompt: the
+                                    // parser finds START_TOKEN at offset 0, enters the
+                                    // span and consumes the `thought\n` label, so the
+                                    // model's first delta (mid chain-of-thought, no
+                                    // marker of its own) is reasoning and the span
+                                    // closes on `<channel|>`. The synthetic chunk's
+                                    // result carries no model output and is dropped.
+                                    // Safe because prompt_injected_reasoning is only
+                                    // true when the prompt ends with that opener.
+                                    if matches!(parser_name.as_str(), "gemma4" | "gemma-4") {
+                                        let _ = parser.parse_reasoning_streaming_incremental(
+                                            GEMMA4_INJECTED_OPENER,
+                                            &[],
+                                        );
+                                    }
                                 }
                                 ChoiceReasoningState {
                                     parser,
