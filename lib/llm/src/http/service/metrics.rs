@@ -679,6 +679,8 @@ pub(crate) struct IslHistogramBuckets {
 pub(crate) struct IslBucketMetrics {
     boundaries: Vec<usize>,
     labels: Vec<String>,
+    // Models whose bucket series already exist (see `ensure_model_series`).
+    initialized_models: std::sync::RwLock<std::collections::HashSet<String>>,
     time_to_first_token: HistogramVec,
     inter_token_latency: HistogramVec,
     request_duration: HistogramVec,
@@ -716,6 +718,7 @@ impl IslBucketMetrics {
         IslBucketMetrics {
             labels: isl_bucket_labels(&boundaries),
             boundaries,
+            initialized_models: Default::default(),
             time_to_first_token: histogram(
                 "time_to_first_token_by_isl_seconds",
                 "Time to first token in seconds, by input sequence length bucket",
@@ -741,6 +744,37 @@ impl IslBucketMetrics {
                 "Cached tokens (prefix cache hits) per request, by input sequence length bucket",
                 buckets.cached_tokens,
             ),
+        }
+    }
+
+    /// Create every `isl_bucket` series of `model` at zero, once per model.
+    ///
+    /// A series that first appears already holding its final value is invisible to
+    /// `rate()` and `increase()`, which only see change between scrapes. Buckets are sparse
+    /// (a bucket may get its first request long after startup) and a burst can start and
+    /// finish between two scrapes, so without this those requests never reach a dashboard.
+    /// Called when the model card is registered, and again (cheaply) per response collector.
+    fn ensure_model_series(&self, model: &str) {
+        if self
+            .initialized_models
+            .read()
+            .is_ok_and(|seen| seen.contains(model))
+        {
+            return;
+        }
+        let Ok(mut seen) = self.initialized_models.write() else {
+            return;
+        };
+        if !seen.insert(model.to_string()) {
+            return;
+        }
+        for label in &self.labels {
+            let labels = [model, label.as_str()];
+            self.time_to_first_token.with_label_values(&labels);
+            self.inter_token_latency.with_label_values(&labels);
+            self.request_duration.with_label_values(&labels);
+            self.output_sequence_length.with_label_values(&labels);
+            self.cached_tokens.with_label_values(&labels);
         }
     }
 
@@ -1539,6 +1573,10 @@ impl Metrics {
             .with_label_values(&[&card.display_name])
             .set(card.migration_limit as i64);
 
+        if let Some(isl_buckets) = &self.isl_buckets {
+            isl_buckets.ensure_model_series(&card.display_name);
+        }
+
         tracing::debug!(
             model = %card.display_name,
             "Successfully updated MDC metrics"
@@ -1963,6 +2001,9 @@ impl std::fmt::Display for ErrorType {
 
 impl ResponseMetricCollector {
     fn new(metrics: Arc<Metrics>, model: String) -> Self {
+        if let Some(isl_buckets) = &metrics.isl_buckets {
+            isl_buckets.ensure_model_series(&model);
+        }
         // Resolve the per-model handles once (cheap clones of the vec entries) so the
         // per-chunk / per-token hot path in `observe_response` does no label hashing.
         let output_tokens_counter = metrics.output_tokens_counter.with_label_values(&[&model]);
@@ -2778,6 +2819,67 @@ mod tests {
         ] {
             assert!(families.iter().any(|f| f == name), "{name} not registered");
         }
+    }
+
+    #[test]
+    fn test_isl_bucket_series_exist_at_zero_before_any_request() {
+        let metrics = Arc::new(Metrics::new().with_isl_buckets(&[1024, 4096]));
+        let registry = Registry::new();
+        metrics.register(&registry).unwrap();
+        let model = "isl-zero-series-model";
+        let series = |family: &str| {
+            registry
+                .gather()
+                .into_iter()
+                .find(|f| f.name() == family)
+                .map(|f| {
+                    f.get_metric()
+                        .iter()
+                        .filter(|m| m.get_label().iter().any(|l| l.value() == model))
+                        .map(|m| m.get_histogram().get_sample_count())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+
+        metrics.isl_buckets.as_ref().unwrap().ensure_model_series(model);
+        for family in [
+            "dynamo_frontend_time_to_first_token_by_isl_seconds",
+            "dynamo_frontend_inter_token_latency_by_isl_seconds",
+            "dynamo_frontend_request_duration_by_isl_seconds",
+            "dynamo_frontend_output_sequence_tokens_by_isl",
+            "dynamo_frontend_cached_tokens_by_isl",
+        ] {
+            assert_eq!(series(family), vec![0, 0, 0], "{family}: one zero series per bucket");
+        }
+
+        // Idempotent, and a collector for the same model neither duplicates nor resets them.
+        metrics.isl_buckets.as_ref().unwrap().ensure_model_series(model);
+        let mut collector = metrics.clone().create_response_collector(model);
+        collector.observe_response(2000, 1);
+        drop(collector);
+        let mut counts = series("dynamo_frontend_time_to_first_token_by_isl_seconds");
+        counts.sort_unstable();
+        assert_eq!(counts, vec![0, 0, 1]);
+
+        // A model first seen through a collector gets all of its buckets too.
+        drop(metrics.clone().create_response_collector("other-model"));
+        let other: Vec<String> = registry
+            .gather()
+            .into_iter()
+            .find(|f| f.name() == "dynamo_frontend_time_to_first_token_by_isl_seconds")
+            .unwrap()
+            .get_metric()
+            .iter()
+            .filter(|m| m.get_label().iter().any(|l| l.value() == "other-model"))
+            .filter_map(|m| {
+                m.get_label()
+                    .iter()
+                    .find(|l| l.name() == ISL_BUCKET_LABEL)
+                    .map(|l| l.value().to_string())
+            })
+            .collect();
+        assert_eq!(other.len(), 3, "other-model buckets: {other:?}");
     }
 
     #[test]

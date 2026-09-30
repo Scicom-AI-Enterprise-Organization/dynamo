@@ -121,7 +121,7 @@ The ratio is defined only when the model has an active L1 cache and observed tok
 
 ### Input-length buckets
 
-Registered only when [`DYN_METRICS_ISL_BUCKETS`](environment-variables.mdx#dyn_metrics_isl_buckets) is set. The histograms above are independent series, so they cannot say how TTFT or ITL behave for long prompts versus short ones. These repeat the same KPIs split by the request's input sequence length: each request lands in exactly one `isl_bucket`, chosen at its first token, when the ISL is known. Requests that fail before a first token are counted only by `dynamo_frontend_requests_total`. Labeled by `model` and `isl_bucket`; histogram buckets match the unbucketed twin.
+Registered only when [`DYN_METRICS_ISL_BUCKETS`](environment-variables.mdx#dyn_metrics_isl_buckets) is set. The histograms above are independent series, so they cannot say how TTFT or ITL behave for long prompts versus short ones. These repeat the same KPIs split by the request's input sequence length: each request lands in exactly one `isl_bucket`, chosen at its first token, when the ISL is known. Requests that fail before a first token are counted only by `dynamo_frontend_requests_total`. Labeled by `model` and `isl_bucket`; histogram buckets match the unbucketed twin. Every bucket's series exist at zero from the moment the model is registered, so `rate()` and `increase()` see a bucket's first requests even when they arrive in a burst between two scrapes.
 
 <ParamField path="dynamo_frontend_time_to_first_token_by_isl_seconds" type="histogram">
   Time to first token in seconds, by input-length bucket.
