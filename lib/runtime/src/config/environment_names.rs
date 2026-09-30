@@ -567,6 +567,11 @@ pub mod llm {
         /// Custom metrics prefix (overrides default "dynamo_frontend")
         pub const DYN_METRICS_PREFIX: &str = "DYN_METRICS_PREFIX";
 
+        /// Comma-separated input-sequence-length bucket upper bounds (inclusive, in tokens)
+        /// for the `*_by_isl` frontend histograms, e.g. `1024,2048,4096,8192,16384`.
+        /// Unset or empty: those histograms are not registered.
+        pub const DYN_METRICS_ISL_BUCKETS: &str = "DYN_METRICS_ISL_BUCKETS";
+
         /// Histogram bucket configuration prefixes. Each is suffixed with `_MIN`,
         /// `_MAX`, or `_COUNT` to form the variable that tunes one frontend
         /// histogram's log-spaced buckets, for example `DYN_METRICS_ITL_MAX`.
@@ -1198,6 +1203,7 @@ mod tests {
             llm::metrics::DYN_METRICS_ITL,
             llm::metrics::DYN_METRICS_ITL_BUCKETS,
             llm::metrics::DYN_METRICS_EMBEDDING_LATENCY,
+            llm::metrics::DYN_METRICS_ISL_BUCKETS,
             llm::audit::DYN_AUDIT_SINKS,
             llm::audit::DYN_AUDIT_FORCE_LOGGING,
             llm::audit::DYN_AUDIT_CAPACITY,

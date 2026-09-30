@@ -38,6 +38,16 @@ the NIXL connector sizes every KV region with the model-wide 16 KV heads and the
 have 4. Both engines need `--disable-hybrid-kv-cache-manager`, which costs KV capacity: the
 sliding layers keep the whole context.
 
+### Frontend KPIs by input-sequence-length bucket (from `feat/prom-metrics-for-bucketing`)
+
+Carried from the 1.5.0 feature branch that runs the B300 frontend. Adds frontend KPIs split by input-sequence-length
+bucket, so TTFT, ITL, request duration, OSL and cached tokens can be compared for short and long
+prompts (the stock histograms cannot be joined on ISL). Opt-in with
+`DYN_METRICS_ISL_BUCKETS=1024,2048,4096,8192,16384`; unset, nothing changes. Families:
+`dynamo_frontend_{time_to_first_token,inter_token_latency,request_duration}_by_isl_seconds`,
+`dynamo_frontend_{output_sequence_tokens,cached_tokens}_by_isl`, labeled `model` and `isl_bucket`.
+See `docs/fern/pages/reference/observability/metrics-catalog.mdx#input-length-buckets`.
+
 ### Validated on tm-h20 (2026-10-17)
 
 Built on 1021 with `build-bindings.sh`, installed into a test venv (vLLM 0.31.0 cu129, torch 2.13
