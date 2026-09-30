@@ -11,6 +11,30 @@ so keep `TIME_DEPLOYMENT` in the sbatch in step with the `.so` you actually buil
 
 ---
 
+## Branch `1.5.0-scicom-gemma4-toolturn-reasoning`
+
+The same fixes rebased onto upstream tag `v1.5.0` (vLLM 0.28.0, `dynamo-parsers` 8.1.0),
+for the k8s deployment on the TM B300 cluster, where the Dynamo operator is 1.5.0 and
+NVFP4 needs vLLM 0.28. Each commit is a `cherry-pick -x` of its 1.3.0 original.
+
+| 1.3.0 commit | On 1.5.0 |
+|---|---|
+| `96f170d87` defect 1 | Ported. Upstream #13061 (1.4.x) made gemma4 reasoning opt-in and added tests asserting the markers stay in `content` without `enable_thinking=true`; this branch reverses that and updates those tests. The Python gate moved into `_reasoning_parser_enabled` in `prepost.py`. |
+| `6545d133b`, `c8893ec25` defect 3 | Ported. The priming moved into the per-choice parser factory (upstream #11563), so every choice of an `n > 1` request is primed. `Gemma4ReasoningParser` in `dynamo-parsers` 8.1.0 still does not override `set_in_reasoning`, and its streaming path still sends text before a stray `<channel|>` to `content`. |
+| `5876eaae9` tests | Ported unchanged. |
+| `1f1a2f5ad` `x-time-deployment` | Ported unchanged. |
+| `cefaa07d5` defect 2 | **Dropped**: fixed upstream by #12684 (in 1.4.0), which forwards `guided_decoding` from `prepost.py`. |
+| `c4c0c777b` vLLM 0.23.0 pin | **Dropped**: 1.5.0 runs on vLLM 0.28. |
+
+With this branch the vLLM worker no longer needs `--scheduler-cls`: the 1.3.0 branch's
+`InstrumentedScheduler` was written for vLLM 0.24 and crashed vLLM 0.23 whenever
+`DYN_FORWARDPASS_METRIC_PORT` was set (the operator always sets it); 1.5.0's matches vLLM 0.28.
+
+Image for Kubernetes: `AIES-Infra/b300-bangkok` `argocd/apps/dynamo-scicom-image` builds the
+wheels in manylinux_2_28 and installs them over `nvcr.io/nvidia/ai-dynamo/vllm-runtime:<tag>`.
+
+---
+
 ## Branch `v1.3.0-gemma4-toolturn-reasoning.1`
 
 Based on `v1.3.0-gemma4-channel-leak.1`.
