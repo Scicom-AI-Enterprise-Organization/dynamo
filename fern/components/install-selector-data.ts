@@ -39,34 +39,7 @@ export const INSTALL_DATA = {
         "backend_version": "v0.25.1",
         "latest": true,
         "commands": {
-          "container": "docker run --gpus all --network host --rm -it nvcr.io/nvidia/ai-dynamo/vllm-runtime-nightly:latest",
-          "wheel": "uv pip install --pre --extra-index-url https://pypi.nvidia.com/ \"ai-dynamo[vllm]==1.4.0.dev20260724\""
-        }
-      },
-      {
-        "backend_version": "v0.24.0",
-        "window": [
-          "2026-06-30",
-          "2026-07-14"
-        ],
-        "pin_date": "2026-07-13",
-        "note": "In nightlies 2026-06-30 → 2026-07-14; pinned to 2026-07-13 (latest in range).",
-        "commands": {
-          "container": "docker run --gpus all --network host --rm -it nvcr.io/nvidia/ai-dynamo/vllm-runtime-nightly:20260713-af0dbfe",
-          "wheel": "uv pip install --pre --extra-index-url https://pypi.nvidia.com/ \"ai-dynamo[vllm]==1.3.0.dev20260713\""
-        }
-      },
-      {
-        "backend_version": "v0.23.0",
-        "window": [
-          "2026-06-16",
-          "2026-06-30"
-        ],
-        "pin_date": "2026-06-28",
-        "note": "In nightlies 2026-06-16 → 2026-06-30; pinned to 2026-06-28 (latest in range).",
-        "commands": {
-          "container": "docker run --gpus all --network host --rm -it nvcr.io/nvidia/ai-dynamo/vllm-runtime-nightly:20260628-7d84764",
-          "wheel": "uv pip install --pre --extra-index-url https://pypi.nvidia.com/ \"ai-dynamo[vllm]==1.3.0.dev20260628\""
+          "container": "docker run --gpus all --network host --rm -it nvcr.io/nvidia/ai-dynamo/vllm-runtime-nightly:latest"
         }
       }
     ]
@@ -107,34 +80,7 @@ export const INSTALL_DATA = {
         "backend_version": "v0.5.15",
         "latest": true,
         "commands": {
-          "container": "docker run --gpus all --network host --rm -it nvcr.io/nvidia/ai-dynamo/sglang-runtime-nightly:latest",
-          "wheel": "uv pip install --pre --extra-index-url https://pypi.nvidia.com/ \"ai-dynamo[sglang]==1.4.0.dev20260724\""
-        }
-      },
-      {
-        "backend_version": "v0.5.14",
-        "window": [
-          "2026-06-29",
-          "2026-07-13"
-        ],
-        "pin_date": "2026-07-12",
-        "note": "In nightlies 2026-06-29 → 2026-07-13; pinned to 2026-07-12 (latest in range).",
-        "commands": {
-          "container": "docker run --gpus all --network host --rm -it nvcr.io/nvidia/ai-dynamo/sglang-runtime-nightly:20260712-0ee5aa6",
-          "wheel": "uv pip install --pre --extra-index-url https://pypi.nvidia.com/ \"ai-dynamo[sglang]==1.3.0.dev20260712\""
-        }
-      },
-      {
-        "backend_version": "v0.5.13.post1",
-        "window": [
-          "2026-06-24",
-          "2026-06-29"
-        ],
-        "pin_date": "2026-06-28",
-        "note": "In nightlies 2026-06-24 → 2026-06-29; pinned to 2026-06-28 (latest in range).",
-        "commands": {
-          "container": "docker run --gpus all --network host --rm -it nvcr.io/nvidia/ai-dynamo/sglang-runtime-nightly:20260628-7d84764",
-          "wheel": "uv pip install --pre --extra-index-url https://pypi.nvidia.com/ \"ai-dynamo[sglang]==1.3.0.dev20260628\""
+          "container": "docker run --gpus all --network host --rm -it nvcr.io/nvidia/ai-dynamo/sglang-runtime-nightly:latest"
         }
       }
     ]
@@ -173,42 +119,6 @@ export const INSTALL_DATA = {
         "latest": true,
         "commands": {
           "container": "docker run --gpus all --network host --rm -it nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime-nightly:latest"
-        }
-      },
-      {
-        "backend_version": "1.3.0rc20",
-        "window": [
-          "2026-07-08",
-          "2026-07-20"
-        ],
-        "pin_date": "2026-07-18",
-        "note": "In nightlies 2026-07-08 → 2026-07-20; pinned to 2026-07-18 (latest in range).",
-        "commands": {
-          "container": "docker run --gpus all --network host --rm -it nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime-nightly:20260718-dad08ea"
-        }
-      },
-      {
-        "backend_version": "1.3.0rc19",
-        "window": [
-          "2026-06-29",
-          "2026-07-08"
-        ],
-        "pin_date": "2026-07-07",
-        "note": "In nightlies 2026-06-29 → 2026-07-08; pinned to 2026-07-07 (latest in range).",
-        "commands": {
-          "container": "docker run --gpus all --network host --rm -it nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime-nightly:20260707-2d2693d"
-        }
-      },
-      {
-        "backend_version": "1.3.0rc18",
-        "window": [
-          "2026-06-11",
-          "2026-06-29"
-        ],
-        "pin_date": "2026-06-28",
-        "note": "In nightlies 2026-06-11 → 2026-06-29; pinned to 2026-06-28 (latest in range).",
-        "commands": {
-          "container": "docker run --gpus all --network host --rm -it nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime-nightly:20260628-7d84764"
         }
       }
     ]
