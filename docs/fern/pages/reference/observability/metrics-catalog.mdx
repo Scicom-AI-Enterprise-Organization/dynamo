@@ -119,6 +119,33 @@ The ratio is defined only when the model has an active L1 cache and observed tok
   Time to first token in seconds.
 </ParamField>
 
+### Input-length buckets
+
+Registered only when [`DYN_METRICS_ISL_BUCKETS`](environment-variables.mdx#dyn_metrics_isl_buckets) is set. The histograms above are independent series, so they cannot say how TTFT or ITL behave for long prompts versus short ones. These repeat the same KPIs split by the request's input sequence length: each request lands in exactly one `isl_bucket`, chosen at its first token, when the ISL is known. Requests that fail before a first token are counted only by `dynamo_frontend_requests_total`. Labeled by `model` and `isl_bucket`; histogram buckets match the unbucketed twin.
+
+<ParamField path="dynamo_frontend_time_to_first_token_by_isl_seconds" type="histogram">
+  Time to first token in seconds, by input-length bucket.
+</ParamField>
+<ParamField path="dynamo_frontend_inter_token_latency_by_isl_seconds" type="histogram">
+  Inter-token latency in seconds, by input-length bucket.
+</ParamField>
+<ParamField path="dynamo_frontend_request_duration_by_isl_seconds" type="histogram">
+  Request duration in seconds, from response tracking start to stream end, by input-length bucket.
+</ParamField>
+<ParamField path="dynamo_frontend_output_sequence_tokens_by_isl" type="histogram">
+  Output sequence length in tokens, by input-length bucket.
+</ParamField>
+<ParamField path="dynamo_frontend_cached_tokens_by_isl" type="histogram">
+  Cached tokens (prefix cache hits) per request, by input-length bucket.
+</ParamField>
+
+p95 TTFT per input-length bucket:
+
+```promql
+histogram_quantile(0.95,
+  sum by (model, isl_bucket, le) (rate(dynamo_frontend_time_to_first_token_by_isl_seconds_bucket[5m])))
+```
+
 ### Migration
 
 Metrics for [request migration](../../kubernetes/fault-tolerance/request-migration.md), the mechanism that continues in-flight requests on a healthy worker when the original worker fails. See [Request Migration Architecture](../../developer-guide/knowledge-base/concepts/fault-tolerance/request-migration-architecture.md) for the internals.

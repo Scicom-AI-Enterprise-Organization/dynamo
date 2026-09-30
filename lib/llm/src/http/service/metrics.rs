@@ -481,6 +481,9 @@ pub struct Metrics {
     output_tokens_counter: IntCounterVec,
     time_to_first_token: HistogramVec,
     inter_token_latency: HistogramVec,
+    /// Optional `*_by_isl` histograms (see [`IslBucketMetrics`]); `None` unless
+    /// `DYN_METRICS_ISL_BUCKETS` is set.
+    isl_buckets: Option<IslBucketMetrics>,
     /// End-to-end latency of an OpenAI `/v1/embeddings` request. Distinct from
     /// `request_duration` so the buckets can be sized for sub-second pooling
     /// inference rather than the 1-512s LLM-generation range. Labeled by
@@ -641,6 +644,162 @@ pub enum ErrorType {
     NotImplemented,
 }
 
+/// Label naming the input-sequence-length bucket on the `*_by_isl` histograms.
+pub const ISL_BUCKET_LABEL: &str = "isl_bucket";
+
+/// Upper limit on `DYN_METRICS_ISL_BUCKETS` boundaries, to bound label cardinality.
+const MAX_ISL_BUCKET_BOUNDARIES: usize = 32;
+
+/// Bucket boundaries (in seconds or tokens) for each `*_by_isl` histogram. They reuse the
+/// boundaries of the unbucketed twin, so both can share a dashboard.
+pub(crate) struct IslHistogramBuckets {
+    pub time_to_first_token: Vec<f64>,
+    pub inter_token_latency: Vec<f64>,
+    pub request_duration: Vec<f64>,
+    pub output_sequence: Vec<f64>,
+    pub cached_tokens: Vec<f64>,
+}
+
+/// Frontend KPIs split by input-sequence-length (ISL) bucket.
+///
+/// The unbucketed histograms (`time_to_first_token_seconds`, `input_sequence_tokens`, ...)
+/// are independent series, so "TTFT of 4k-token prompts" cannot be recovered from them.
+/// With `DYN_METRICS_ISL_BUCKETS=1024,2048,4096` every request that produced a first token
+/// lands in exactly one `isl_bucket` (`0-1024`, `1025-2048`, `2049-4096`, `4097+`) and the
+/// same KPI is recorded per bucket:
+///
+/// - `{prefix}_time_to_first_token_by_isl_seconds`
+/// - `{prefix}_inter_token_latency_by_isl_seconds`
+/// - `{prefix}_request_duration_by_isl_seconds` (from response tracking start to stream end)
+/// - `{prefix}_output_sequence_tokens_by_isl`
+/// - `{prefix}_cached_tokens_by_isl`
+///
+/// Labeled by `model` and `isl_bucket`. The bucket is latched at the first token, where the
+/// ISL is known; requests that fail before it are only counted by `requests_total`.
+pub(crate) struct IslBucketMetrics {
+    boundaries: Vec<usize>,
+    labels: Vec<String>,
+    time_to_first_token: HistogramVec,
+    inter_token_latency: HistogramVec,
+    request_duration: HistogramVec,
+    output_sequence_length: HistogramVec,
+    cached_tokens: HistogramVec,
+}
+
+impl IslBucketMetrics {
+    /// Build from `DYN_METRICS_ISL_BUCKETS`; `None` when unset, empty or invalid.
+    fn from_env(prefix: &str, buckets: IslHistogramBuckets) -> Option<Self> {
+        let raw = std::env::var(env_metrics::DYN_METRICS_ISL_BUCKETS).ok()?;
+        match parse_isl_bucket_boundaries(&raw) {
+            Ok(Some(boundaries)) => Some(Self::new(prefix, boundaries, buckets)),
+            Ok(None) => None,
+            Err(error) => {
+                tracing::warn!(
+                    value = %raw,
+                    %error,
+                    env = env_metrics::DYN_METRICS_ISL_BUCKETS,
+                    "Invalid ISL bucket boundaries; ISL-bucketed metrics disabled"
+                );
+                None
+            }
+        }
+    }
+
+    fn new(prefix: &str, boundaries: Vec<usize>, buckets: IslHistogramBuckets) -> Self {
+        let histogram = |suffix: &str, help: &str, bounds: Vec<f64>| {
+            HistogramVec::new(
+                HistogramOpts::new(format!("{prefix}_{suffix}"), help).buckets(bounds),
+                &["model", ISL_BUCKET_LABEL],
+            )
+            .expect("valid ISL-bucketed histogram")
+        };
+        IslBucketMetrics {
+            labels: isl_bucket_labels(&boundaries),
+            boundaries,
+            time_to_first_token: histogram(
+                "time_to_first_token_by_isl_seconds",
+                "Time to first token in seconds, by input sequence length bucket",
+                buckets.time_to_first_token,
+            ),
+            inter_token_latency: histogram(
+                "inter_token_latency_by_isl_seconds",
+                "Inter-token latency in seconds, by input sequence length bucket",
+                buckets.inter_token_latency,
+            ),
+            request_duration: histogram(
+                "request_duration_by_isl_seconds",
+                "Duration of LLM requests in seconds, by input sequence length bucket",
+                buckets.request_duration,
+            ),
+            output_sequence_length: histogram(
+                "output_sequence_tokens_by_isl",
+                "Output sequence length in tokens, by input sequence length bucket",
+                buckets.output_sequence,
+            ),
+            cached_tokens: histogram(
+                "cached_tokens_by_isl",
+                "Cached tokens (prefix cache hits) per request, by input sequence length bucket",
+                buckets.cached_tokens,
+            ),
+        }
+    }
+
+    /// Index of the bucket holding `isl`: the first boundary `>= isl`, else the open top bucket.
+    fn bucket_index(&self, isl: usize) -> usize {
+        self.boundaries.partition_point(|&upper| upper < isl)
+    }
+
+    fn label(&self, index: usize) -> &str {
+        &self.labels[index]
+    }
+
+    fn register(&self, registry: &Registry) -> Result<(), prometheus::Error> {
+        registry.register(Box::new(self.time_to_first_token.clone()))?;
+        registry.register(Box::new(self.inter_token_latency.clone()))?;
+        registry.register(Box::new(self.request_duration.clone()))?;
+        registry.register(Box::new(self.output_sequence_length.clone()))?;
+        registry.register(Box::new(self.cached_tokens.clone()))?;
+        Ok(())
+    }
+}
+
+/// Parse `DYN_METRICS_ISL_BUCKETS`: positive integers, any order, duplicates ignored.
+/// `Ok(None)` for an empty value.
+fn parse_isl_bucket_boundaries(raw: &str) -> Result<Option<Vec<usize>>, String> {
+    let mut boundaries = Vec::new();
+    for part in raw.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let value: usize = part
+            .parse()
+            .map_err(|_| format!("`{part}` is not a positive integer"))?;
+        if value == 0 {
+            return Err("boundaries must be greater than 0".to_string());
+        }
+        boundaries.push(value);
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
+    if boundaries.len() > MAX_ISL_BUCKET_BOUNDARIES {
+        return Err(format!(
+            "at most {MAX_ISL_BUCKET_BOUNDARIES} boundaries are allowed, got {}",
+            boundaries.len()
+        ));
+    }
+    Ok((!boundaries.is_empty()).then_some(boundaries))
+}
+
+/// `isl_bucket` label values for sorted inclusive upper bounds:
+/// `[1024, 4096]` -> `["0-1024", "1025-4096", "4097+"]`.
+fn isl_bucket_labels(boundaries: &[usize]) -> Vec<String> {
+    let mut labels = Vec::with_capacity(boundaries.len() + 1);
+    let mut lower = 0;
+    for &upper in boundaries {
+        labels.push(format!("{lower}-{upper}"));
+        lower = upper + 1;
+    }
+    labels.push(format!("{lower}+"));
+    labels
+}
+
 /// Track response-specific metrics
 pub struct ResponseMetricCollector {
     metrics: Arc<Metrics>,
@@ -654,6 +813,12 @@ pub struct ResponseMetricCollector {
     time_to_first_token: prometheus::Histogram,
     inter_token_latency: Option<prometheus::local::LocalHistogram>,
     itl_pending_tokens: u64,
+    // ISL bucket of this request (index into `IslBucketMetrics::labels`), latched at the
+    // first token when the `*_by_isl` histograms are enabled. Its ITL handle is
+    // request-local like `inter_token_latency`, and resolved on first use.
+    isl_bucket: Option<usize>,
+    isl_inter_token_latency: Option<prometheus::local::LocalHistogram>,
+    cached_tokens_val: Option<usize>,
     input_sequence_length: prometheus::Histogram,
     cached_tokens: prometheus::Histogram,
     // Per-model multimodal count histogram handles, resolved once at construction.
@@ -839,7 +1004,7 @@ impl Metrics {
                 frontend_metric_name(frontend_service::REQUEST_DURATION_SECONDS),
                 "Duration of LLM requests",
             )
-            .buckets(request_duration_buckets),
+            .buckets(request_duration_buckets.clone()),
             &["model"],
         )
         .unwrap();
@@ -869,7 +1034,7 @@ impl Metrics {
                 frontend_metric_name(frontend_service::OUTPUT_SEQUENCE_TOKENS),
                 "Output sequence length in tokens",
             )
-            .buckets(output_sequence_buckets),
+            .buckets(output_sequence_buckets.clone()),
             &["model"],
         )
         .unwrap();
@@ -893,7 +1058,7 @@ impl Metrics {
                 frontend_metric_name(frontend_service::TIME_TO_FIRST_TOKEN_SECONDS),
                 "Time to first token in seconds",
             )
-            .buckets(time_to_first_token_buckets),
+            .buckets(time_to_first_token_buckets.clone()),
             &["model"],
         )
         .unwrap();
@@ -907,7 +1072,7 @@ impl Metrics {
                 frontend_metric_name(frontend_service::INTER_TOKEN_LATENCY_SECONDS),
                 "Inter-token latency in seconds",
             )
-            .buckets(inter_token_latency_buckets),
+            .buckets(inter_token_latency_buckets.clone()),
             &["model"],
         )
         .unwrap();
@@ -1118,6 +1283,17 @@ impl Metrics {
         )
         .unwrap();
 
+        let isl_buckets = IslBucketMetrics::from_env(
+            &prefix,
+            IslHistogramBuckets {
+                time_to_first_token: time_to_first_token_buckets,
+                inter_token_latency: inter_token_latency_buckets,
+                request_duration: request_duration_buckets,
+                output_sequence: output_sequence_buckets,
+                cached_tokens: input_sequence_buckets.clone(),
+            },
+        );
+
         Metrics {
             request_started_counter,
             request_counter,
@@ -1133,6 +1309,7 @@ impl Metrics {
             output_tokens_counter,
             time_to_first_token,
             inter_token_latency,
+            isl_buckets,
             embedding_latency,
             images_per_request,
             videos_per_request,
@@ -1292,6 +1469,9 @@ impl Metrics {
         registry.register(Box::new(self.output_tokens_counter.clone()))?;
         registry.register(Box::new(self.time_to_first_token.clone()))?;
         registry.register(Box::new(self.inter_token_latency.clone()))?;
+        if let Some(isl_buckets) = &self.isl_buckets {
+            isl_buckets.register(registry)?;
+        }
         registry.register(Box::new(self.embedding_latency.clone()))?;
         registry.register(Box::new(self.images_per_request.clone()))?;
         registry.register(Box::new(self.videos_per_request.clone()))?;
@@ -1497,6 +1677,26 @@ impl Metrics {
     }
 
     /// Create a new [`ResponseMetricCollector`] for collecting per-response metrics (i.e., TTFT, ITL)
+    /// Test helper: enable the `*_by_isl` histograms with the given ISL boundaries,
+    /// independent of `DYN_METRICS_ISL_BUCKETS`.
+    #[cfg(test)]
+    pub(crate) fn with_isl_buckets(mut self, boundaries: &[usize]) -> Self {
+        let latency = vec![0.001, 0.01, 0.1, 1.0, 10.0, 100.0];
+        let tokens = vec![1.0, 10.0, 100.0, 1000.0, 10000.0];
+        self.isl_buckets = Some(IslBucketMetrics::new(
+            "dynamo_frontend",
+            boundaries.to_vec(),
+            IslHistogramBuckets {
+                time_to_first_token: latency.clone(),
+                inter_token_latency: latency.clone(),
+                request_duration: latency,
+                output_sequence: tokens.clone(),
+                cached_tokens: tokens,
+            },
+        ));
+        self
+    }
+
     pub fn create_response_collector(self: Arc<Self>, model: &str) -> ResponseMetricCollector {
         ResponseMetricCollector::new(self, model.to_string())
     }
@@ -1782,6 +1982,9 @@ impl ResponseMetricCollector {
             time_to_first_token,
             inter_token_latency: None,
             itl_pending_tokens: 0,
+            isl_bucket: None,
+            isl_inter_token_latency: None,
+            cached_tokens_val: None,
             input_sequence_length,
             cached_tokens,
             images_per_request,
@@ -1879,6 +2082,20 @@ impl ResponseMetricCollector {
         })
     }
 
+    /// Request-local handle for the ISL-bucketed ITL histogram, resolved on first use.
+    /// `None` when the `*_by_isl` histograms are disabled or no bucket is latched yet.
+    fn local_isl_inter_token_latency(&mut self) -> Option<&mut prometheus::local::LocalHistogram> {
+        let index = self.isl_bucket?;
+        let isl_buckets = self.metrics.isl_buckets.as_ref()?;
+        let model = self.model.as_str();
+        Some(self.isl_inter_token_latency.get_or_insert_with(|| {
+            isl_buckets
+                .inter_token_latency
+                .with_label_values(&[model, isl_buckets.label(index)])
+                .local()
+        }))
+    }
+
     /// Observe the current output sequence length
     pub fn observe_current_osl(&mut self, osl: usize) {
         self.osl = osl;
@@ -1896,6 +2113,7 @@ impl ResponseMetricCollector {
         {
             self.cached_tokens_observed = true;
             self.cached_tokens.observe(tokens as f64);
+            self.cached_tokens_val = Some(tokens);
         }
     }
 
@@ -1982,6 +2200,15 @@ impl ResponseMetricCollector {
             self.ttft_ms = Some(ttft * 1000.0);
             self.time_to_first_token.observe(ttft);
 
+            if let Some(isl_buckets) = self.metrics.isl_buckets.as_ref() {
+                let index = isl_buckets.bucket_index(isl);
+                self.isl_bucket = Some(index);
+                isl_buckets
+                    .time_to_first_token
+                    .with_label_values(&[self.model.as_str(), isl_buckets.label(index)])
+                    .observe(ttft);
+            }
+
             // Update per-worker TTFT and input sequence tokens gauges - attributed to prefill worker.
             // Both gauges are updated atomically from the same request to correlate latency with input size.
             // Use stored worker_type (from routing time) to avoid MDC lookup.
@@ -2022,6 +2249,14 @@ impl ResponseMetricCollector {
                 // Resolve the request-local histogram on the first ITL only, then reuse
                 // it without re-hashing the model label for each output token.
                 let histogram = self.local_inter_token_latency();
+                for _ in 0..num_tokens {
+                    histogram.observe(itl);
+                }
+                if should_flush {
+                    histogram.flush();
+                }
+            }
+            if let Some(histogram) = self.local_isl_inter_token_latency() {
                 for _ in 0..num_tokens {
                     histogram.observe(itl);
                 }
@@ -2073,6 +2308,9 @@ impl Drop for ResponseMetricCollector {
         if let Some(histogram) = &self.inter_token_latency {
             histogram.flush();
         }
+        if let Some(histogram) = &self.isl_inter_token_latency {
+            histogram.flush();
+        }
         self.itl_pending_tokens = 0;
 
         if !self.detokenize_latency_total.is_zero() && self.detokenize_count_total > 0 {
@@ -2094,6 +2332,30 @@ impl Drop for ResponseMetricCollector {
                 .output_sequence_length
                 .with_label_values(&[&self.model])
                 .observe(self.osl as f64);
+        }
+
+        // ISL-bucketed duration, OSL and cached tokens, for requests that reached a first
+        // token (where the bucket is latched).
+        if let (Some(index), Some(isl_buckets)) =
+            (self.isl_bucket, self.metrics.isl_buckets.as_ref())
+        {
+            let labels = [self.model.as_str(), isl_buckets.label(index)];
+            isl_buckets
+                .request_duration
+                .with_label_values(&labels)
+                .observe(self.start_time.elapsed().as_secs_f64());
+            if self.osl > 0 {
+                isl_buckets
+                    .output_sequence_length
+                    .with_label_values(&labels)
+                    .observe(self.osl as f64);
+            }
+            if let Some(cached) = self.cached_tokens_val {
+                isl_buckets
+                    .cached_tokens
+                    .with_label_values(&labels)
+                    .observe(cached as f64);
+            }
         }
 
         // Record request summary on the enclosing span.
@@ -2412,6 +2674,133 @@ async fn handler_metrics(State(state): State<Arc<MetricsHandlerState>>) -> impl 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_isl_bucket_boundaries_parse_and_label() {
+        assert_eq!(parse_isl_bucket_boundaries(""), Ok(None));
+        assert_eq!(parse_isl_bucket_boundaries(" , "), Ok(None));
+        assert_eq!(
+            parse_isl_bucket_boundaries(" 4096,1024 , 2048,1024"),
+            Ok(Some(vec![1024, 2048, 4096]))
+        );
+        assert!(parse_isl_bucket_boundaries("1024,abc").is_err());
+        assert!(parse_isl_bucket_boundaries("0,1024").is_err());
+        assert!(parse_isl_bucket_boundaries("-5").is_err());
+        let too_many: Vec<String> = (1..=33).map(|i| (i * 100).to_string()).collect();
+        assert!(parse_isl_bucket_boundaries(&too_many.join(",")).is_err());
+        assert_eq!(
+            isl_bucket_labels(&[1024, 2048, 4096]),
+            vec!["0-1024", "1025-2048", "2049-4096", "4097+"]
+        );
+    }
+
+    #[test]
+    fn test_isl_bucket_upper_bounds_are_inclusive() {
+        let metrics = Metrics::new().with_isl_buckets(&[1024, 4096]);
+        let buckets = metrics.isl_buckets.as_ref().unwrap();
+        for (isl, label) in [
+            (0, "0-1024"),
+            (1024, "0-1024"),
+            (1025, "1025-4096"),
+            (4096, "1025-4096"),
+            (4097, "4097+"),
+            (128_000, "4097+"),
+        ] {
+            assert_eq!(buckets.label(buckets.bucket_index(isl)), label, "isl={isl}");
+        }
+    }
+
+    #[test]
+    fn test_isl_bucketed_metrics_follow_each_request() {
+        let metrics = Arc::new(Metrics::new().with_isl_buckets(&[1024, 4096]));
+        let registry = Registry::new();
+        metrics.register(&registry).unwrap();
+        let model = "isl-bucket-model";
+
+        // Short prompt: TTFT chunk, then 3 more tokens, 256 cached tokens.
+        let mut short = metrics.clone().create_response_collector(model);
+        short.observe_cached_tokens(Some(256));
+        short.observe_response(900, 1);
+        short.observe_response(900, 3);
+        short.observe_current_osl(4);
+        drop(short);
+
+        // Long prompt: a single 2-token chunk, so TTFT only.
+        let mut long = metrics.clone().create_response_collector(model);
+        long.observe_response(3000, 2);
+        long.observe_current_osl(2);
+        drop(long);
+
+        // A request that never produced a token has no bucket and records nothing.
+        drop(metrics.clone().create_response_collector(model));
+
+        let buckets = metrics.isl_buckets.as_ref().unwrap();
+        let count = |h: &HistogramVec, bucket: &str| {
+            h.with_label_values(&[model, bucket]).get_sample_count()
+        };
+        assert_eq!(count(&buckets.time_to_first_token, "0-1024"), 1);
+        assert_eq!(count(&buckets.time_to_first_token, "1025-4096"), 1);
+        assert_eq!(count(&buckets.time_to_first_token, "4097+"), 0);
+        assert_eq!(count(&buckets.inter_token_latency, "0-1024"), 3);
+        assert_eq!(count(&buckets.inter_token_latency, "1025-4096"), 0);
+        assert_eq!(count(&buckets.request_duration, "0-1024"), 1);
+        assert_eq!(count(&buckets.request_duration, "1025-4096"), 1);
+        assert_eq!(
+            buckets
+                .output_sequence_length
+                .with_label_values(&[model, "0-1024"])
+                .get_sample_sum(),
+            4.0
+        );
+        assert_eq!(count(&buckets.cached_tokens, "0-1024"), 1);
+        assert_eq!(count(&buckets.cached_tokens, "1025-4096"), 0);
+
+        // The unbucketed histograms keep counting every request as before.
+        assert_eq!(
+            metrics
+                .time_to_first_token
+                .with_label_values(&[model])
+                .get_sample_count(),
+            2
+        );
+
+        let families: Vec<String> = registry
+            .gather()
+            .iter()
+            .map(|family| family.name().to_string())
+            .collect();
+        for name in [
+            "dynamo_frontend_time_to_first_token_by_isl_seconds",
+            "dynamo_frontend_inter_token_latency_by_isl_seconds",
+            "dynamo_frontend_request_duration_by_isl_seconds",
+            "dynamo_frontend_output_sequence_tokens_by_isl",
+            "dynamo_frontend_cached_tokens_by_isl",
+        ] {
+            assert!(families.iter().any(|f| f == name), "{name} not registered");
+        }
+    }
+
+    #[test]
+    fn test_isl_bucketed_metrics_are_off_without_the_env_var() {
+        if std::env::var(env_metrics::DYN_METRICS_ISL_BUCKETS).is_ok() {
+            return;
+        }
+        let metrics = Arc::new(Metrics::new());
+        assert!(metrics.isl_buckets.is_none());
+        let registry = Registry::new();
+        metrics.register(&registry).unwrap();
+        let mut collector = metrics.clone().create_response_collector("no-isl-buckets");
+        collector.observe_response(500, 1);
+        collector.observe_response(500, 1);
+        drop(collector);
+        assert!(
+            registry
+                .gather()
+                .iter()
+                .all(|family| !family.name().contains("_by_isl")),
+            "no *_by_isl family may be registered when DYN_METRICS_ISL_BUCKETS is unset"
+        );
+    }
 
     fn model_ready_value_with_name(
         registry: &Registry,

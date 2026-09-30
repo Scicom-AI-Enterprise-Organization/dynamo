@@ -11,6 +11,18 @@ so keep `TIME_DEPLOYMENT` in the sbatch in step with the `.so` you actually buil
 
 ---
 
+## Branch `feat/prom-metrics-for-bucketing`
+
+Off `1.5.0-scicom-gemma4-toolturn-reasoning`. Adds frontend KPIs split by input-sequence-length
+bucket, so TTFT, ITL, request duration, OSL and cached tokens can be compared for short and long
+prompts (the stock histograms cannot be joined on ISL). Opt-in with
+`DYN_METRICS_ISL_BUCKETS=1024,2048,4096,8192,16384`; unset, nothing changes. Families:
+`dynamo_frontend_{time_to_first_token,inter_token_latency,request_duration}_by_isl_seconds`,
+`dynamo_frontend_{output_sequence_tokens,cached_tokens}_by_isl`, labeled `model` and `isl_bucket`.
+See `docs/fern/pages/reference/observability/metrics-catalog.mdx#input-length-buckets`.
+
+---
+
 ## Branch `1.5.0-scicom-gemma4-toolturn-reasoning`
 
 The same fixes rebased onto upstream tag `v1.5.0` (vLLM 0.28.0, `dynamo-parsers` 8.1.0),
