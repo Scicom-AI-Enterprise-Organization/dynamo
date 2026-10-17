@@ -4,16 +4,19 @@ This repository is Scicom's fork of [`ai-dynamo/dynamo`](https://github.com/ai-d
 
 - **`main` is not where Scicom code lives.** It is a mirror of upstream `main` taken on 2026-07-26 (`769ee07`, upstream PR #11973) plus this file. It is not kept in sync with upstream.
 - **Each Scicom branch starts from an upstream release or commit** and carries a small stack of Scicom commits. Its `deploy/scicom/DEPLOYMENT_CHANGELOG.md` has the full detail: evidence, rebuild steps, and why each change exists.
+- **Since 1.6.0 the fork also carries a vLLM patch** (`deploy/scicom/patches/` on the 1.6.0 branch) so a gemma-4 prefill and decode engine can run with different TP sizes, and the frontend ISL-bucket metrics.
 - **The other ~2,800 branches in this fork** (people's branches, `pull-request/N`) are copies of upstream refs from when the fork was created. They are not Scicom work.
 
 ## At a glance
 
-Newest first. "Live" means serving production or benchmark traffic on 2026-09-30.
+Newest first. "Live" means serving production or benchmark traffic on 2026-10-17.
 
 | Branch / tag | Tip | Based on | Status | Runs on |
 |---|---|---|---|---|
-| [`feat/prom-metrics-for-bucketing`](#featprom-metrics-for-bucketing) | `85aff69` | `1.5.0-scicom-gemma4-toolturn-reasoning` | live (frontend) | TM B300 Bangkok k8s |
-| [`1.5.0-scicom-gemma4-toolturn-reasoning`](#150-scicom-gemma4-toolturn-reasoning) | `3e45671` | upstream `v1.5.0` | live (workers); base for new work | TM B300 Bangkok k8s |
+| `v1.6.0-nightly-20261016-gemma4-hetero-tp.1` (tag + GitHub prerelease) | `197b12e` | same as the branch below | release artifact | prebuilt `ai_dynamo_runtime` wheel + vLLM 0.31.0 patch |
+| [`1.6.0-scicom-gemma4-toolturn-reasoning`](#160-scicom-gemma4-toolturn-reasoning) | `197b12e` | upstream `main` `f95c85b` (the 1.6.0.dev20261016 nightly) | tested on tm-h20; base for new work | tm-h20 test nodes 1021 -> 1019 (not prod) |
+| [`feat/prom-metrics-for-bucketing`](#featprom-metrics-for-bucketing) | `85aff69` | `1.5.0-scicom-gemma4-toolturn-reasoning` | live (frontend); carried into 1.6.0 | TM B300 Bangkok k8s |
+| [`1.5.0-scicom-gemma4-toolturn-reasoning`](#150-scicom-gemma4-toolturn-reasoning) | `3e45671` | upstream `v1.5.0` | live (workers) | TM B300 Bangkok k8s |
 | [`v1.3.0-gemma4-toolturn-reasoning.1`](#v130-gemma4-toolturn-reasoning1) | `0288f8f` | `v1.3.0-gemma4-channel-leak.1` | live, frozen | tm-h20 Slurm fleet |
 | [`v1.3.0-gemma4-channel-leak.1`](#v130-gemma4-channel-leak1-branch-tag-and-release) (branch) | `1f1a2f5` | upstream `39c7bcb` | superseded | tm-h20, 2026-07-28 to 07-31 |
 | `v1.3.0-gemma4-channel-leak.1` (tag + GitHub release) | `ce28575` | same | release artifact | prebuilt `ai_dynamo_runtime` wheel |
@@ -45,11 +48,30 @@ All three are in Dynamo's frontend (the preprocessor and response parsing), not 
 
 | # | Symptom | Cause | Upstream status (upstream main, checked 2026-09-30) |
 |---|---|---|---|
-| 1 | Thinking **off**, turn ends in a tool response: reply comes back as literal `<\|channel>thought\n<channel\|>You're all clear! …` (200/200) | The gemma4 reasoning parser is switched off when `enable_thinking` is not true, but special tokens are still kept, so nothing consumes the delimiters the model writes itself | **Not fixed, and the opposite is intended.** Upstream #13061 (1.4.x) made gemma4 reasoning opt-in and added a test asserting these markers stay in `content`. The fork reverses that. |
+| 1 | Thinking **off**, turn ends in a tool response: reply comes back as literal `<\|channel>thought\n<channel\|>You're all clear! …` (200/200) | The gemma4 reasoning parser is switched off when `enable_thinking` is not true, but special tokens are still kept, so nothing consumes the delimiters the model writes itself | **Not fixed, and the opposite is intended.** Upstream #13061 (1.4.x) made gemma4 reasoning opt-in and added a test asserting these markers stay in `content`. The fork reverses that. On upstream main of 2026-10-16 the same gate also sits in the unified (v2) parser path; the 1.6.0 branch reverses both. |
 | 2 | `guided_json` / `guided_choice` / `response_format` ignored on the vLLM chat-processor path; the caller gets fenced JSON and retries 4x | `vllm_processor.py` built `sampling_options` from a whitelist that omitted structured outputs | **Fixed upstream** by #12684 (in 1.4.0). Dropped from the 1.5.0 branch. |
-| 3 | Thinking **on**, turn after a tool response: the whole chain-of-thought is returned as `content` (0/200 correct) | Gemma 4's template leaves `<\|channel>thought\n` open at the end of the prompt, so the completion starts inside the channel. `prompt_injected_reasoning_start` did not recognise the gemma4 opener, and `Gemma4ReasoningParser` ignores `set_in_reasoning` | **Not fixed, not reported.** Still true in `dynamo-parsers` 8.1.0 and on upstream main. The fork primes the parser with the opener. |
+| 3 | Thinking **on**, turn after a tool response: the whole chain-of-thought is returned as `content` (0/200 correct) | Gemma 4's template leaves `<\|channel>thought\n` open at the end of the prompt, so the completion starts inside the channel. `prompt_injected_reasoning_start` did not recognise the gemma4 opener, and `Gemma4ReasoningParser` ignores `set_in_reasoning` | **Fixed upstream for the opener check** by 2026-10-16: upstream main arms the gemma4 parser when the prompt ends in `<\|channel>thought` or `<\|channel>`. The 1.6.0 branch keeps upstream's check, adds the `gemma-4` alias, and still primes the parser. |
 
 ## Branches in detail
+
+### `1.6.0-scicom-gemma4-toolturn-reasoning`
+
+**Every Scicom change on upstream `main` at `f95c85b` (2026-10-16), the commit behind the `ai-dynamo` 1.6.0.dev20261016 nightly, which pins vLLM 0.31.0.** Created 2026-10-17 through PR #1 (merge commit `197b12e`, so the cherry-pick ids below stay valid). Released as `v1.6.0-nightly-20261016-gemma4-hetero-tp.1` (prerelease, because the base is a nightly).
+
+| 1.6.0 commit | From | What changed in the port |
+|---|---|---|
+| `3ce890e` | `1d92aee` | `x-time-deployment`. Unchanged. |
+| `3afdddf` | `5b68611` | Defect 1, legacy path. Upstream's new `all_unified_families_honor_normalized_request_controls_for_all_selector_shapes` test and its gemma4 selector-shape test now expect the parser to stay on. |
+| `dcc809d` | `ec90068` | Defect 3a. Upstream now has its own gemma4 opener check; kept, plus the `gemma-4` alias. |
+| `af092ed`, `92dcecc` | `362a598`, `64398fe` | Defect 3b priming and its end-to-end test. |
+| `8eff15d`, `2b6a0c8`, `929e907` | `7ff366d`, `43ec6d3`, `3e45671` | `deploy/scicom/` docs. |
+| `a98672d`, `067bd86` | `c21fa44`, `85aff69` | ISL-bucket frontend metrics from `feat/prom-metrics-for-bucketing`, next to upstream's renamed `DYN_METRICS_*` histogram variables. |
+| `7a2e5fa` | new | Defect 1 in upstream's unified (v2) parser path, which only `DYN_PARSER_VERSION=2` uses for gemma4. |
+| `0780d75` | new | `deploy/scicom/patches/vllm-0.31.0-nixl-per-region-kv-heads.patch` + `apply-vllm-patches.sh`: lets a gemma-4 prefill and decode run with different TP (stock vLLM fails the KV handshake on the first global layer, `SPLIT region 5`). Needs `--disable-hybrid-kv-cache-manager` on both engines, which costs KV capacity. |
+
+**Verified on tm-h20** (built from `7a2e5fa`, prefill TP4 on 1021 -> decode TP8 on 1019): gemma4 tool-turn checks 3/3 with thinking on and off on both parser paths, `guided_json` and `x-time-deployment` pass, recall check 9/9 across nodes (stock vLLM: HTTP 500). Rust: `postprocessor_parsing_stream` 109/109, reasoning/thinking/isl unit tests all pass; vLLM connector tests 64/64. Details in the branch's `deploy/scicom/DEPLOYMENT_CHANGELOG.md`.
+
+**Not deployed to production.** tm-h20 prod still runs `v1.3.0-gemma4-toolturn-reasoning.1`; B300 still runs the 1.5.0 images.
 
 ### `feat/prom-metrics-for-bucketing`
 
@@ -140,8 +162,9 @@ They are labelled `model` and `isl_bucket` (`0-512`, `513-1024`, … `16385+`), 
 | **tm-h20** (Slurm, bare metal, Singapore) | `v1.3.0-gemma4-toolturn-reasoning.1` @ `c8893ec` | `deploy/scicom/build-bindings.sh`: editable install, `_core.abi3.so` swapped by rename (never overwrite a mapped `.so`) | Bump `TIME_DEPLOYMENT` in the sbatch, restart the job. Record changes in `ucc_slurm-ui-job` `jobs/tm-h20/README.md`. |
 | **TM B300 Bangkok** (k3s, Dynamo operator 1.5.0), workers | `1.5.0-scicom-gemma4-toolturn-reasoning` @ `3e45671` | `AIES-Infra/b300-bangkok` app `dynamo-scicom-image`: a BuildKit Job on node-1 builds manylinux wheels over `vllm-runtime:1.5.0` and imports `localhost/scicom/dynamo-vllm-runtime:<tag>` into containerd | GitOps: new Job per commit (Rust tests gate the build), then the image tag in `argocd/apps/gemma4-31b-scicom`. `runtimeVersionOverride: "1.5.0"` is required, because the tag's semver sorts below 1.5.0. |
 | **TM B300 Bangkok**, frontend | `feat/prom-metrics-for-bucketing` @ `85aff69` | same | same; `DYN_METRICS_ISL_BUCKETS` set on the frontend |
+| **tm-h20 test nodes** 1021 (prefill TP4) -> 1019 (decode TP8), not prod | `1.6.0-scicom-gemma4-toolturn-reasoning` @ `7a2e5fa` | `build-bindings.sh` into the venv `/mnt/data/dynamo-hetero/venv` (vLLM 0.31.0 cu129) + `apply-vllm-patches.sh` | Started by hand, own etcd :2399 / NATS :4242 / frontend :8030 |
 
-## Known issues (both branch lines, not fixed)
+## Known issues (1.3.0 and 1.5.0 lines, not fixed; not re-tested on 1.6.0)
 
 - **`/v1/completions` does not add gemma's `<bos>`.** A raw prompt degenerates (`" France is France is …"`); the same prompt with `<bos>` answers correctly. Chat completions are unaffected. This is an upstream Dynamo bug.
 - **`guided_json` together with `enable_thinking=true` on gemma4.** The grammar forces JSON from the first token, so no reasoning happens, and about 10% of replies loop into invalid JSON (27/30 valid on 1.5.0, 10/12 on 1.3.0). Structured output with thinking off is 100%.
