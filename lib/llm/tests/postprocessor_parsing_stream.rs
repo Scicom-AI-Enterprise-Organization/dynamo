@@ -6390,6 +6390,7 @@ async fn explicit_v2_rejects_legacy_and_mixed_stream_parser_pairs() {
             "{reasoning:?}/{parser:?}: {error}"
         );
     }
+}
 
 /// Gemma 4 leaves the thought channel OPEN in the prompt when
 /// `add_generation_prompt` runs after a tool response with thinking enabled:
