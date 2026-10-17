@@ -30,6 +30,8 @@ Each commit is a `cherry-pick -x` of its 1.5.0 commit, including the two of
 | `7ff366d43`, `43ec6d3d0`, `3e4567125` build and docs | `8eff15d1ab`, `2b6a0c8e74`, `929e907e1f` | Unchanged. |
 | (new) | `0780d7527d` | vLLM 0.31.0 NIXL patch for prefill/decode TP mismatch, see below. |
 | `c21fa44d9`, `85aff69ec` (`feat/prom-metrics-for-bucketing`) | `a98672d367`, `067bd86e1c` | Ported. Upstream renamed the histogram bucket variables to `DYN_METRICS_*` and kept `DYN_HISTOGRAM_*` as a deprecated fallback; `DYN_METRICS_ISL_BUCKETS` sits next to them. |
+| (new) | `7a2e5fa3fd` | Upstream 1.6 has a second gemma4 gate, in the unified (v2) parser path, that still turned reasoning off unless `enable_thinking=true`. `DYN_PARSER_VERSION=auto` sends gemma4 down the legacy path, so the leak only came back with `DYN_PARSER_VERSION=2`; this keeps the parser on there too and updates upstream's two raw-batch tests. The SGLang gate is left as upstream has it. |
+| (new) | `fa968622af` | Test-only: restores a closing brace lost while keeping both sets of tests at the end of `postprocessor_parsing_stream.rs`. |
 
 ### Prefill and decode with different TP (gemma-4)
 
@@ -52,9 +54,27 @@ See `docs/fern/pages/reference/observability/metrics-catalog.mdx#input-length-bu
 
 ### Validated on tm-h20 (2026-10-17)
 
-Built on 1021 with `build-bindings.sh`, installed into a test venv (vLLM 0.31.0 cu129, torch 2.13
-cu129), test frontend on 1021 with its own etcd (:2399) and NATS (:4242), prefill TP4 on 1021,
-decode TP8 on 1019. Results are filled in after the run.
+Built on 1021 from `7a2e5fa3f` with `build-bindings.sh` and installed into a test venv (vLLM
+0.31.0 cu129 with `apply-vllm-patches.sh`, torch 2.13 cu129). Test frontend on 1021 with its own
+etcd (:2399) and NATS (:4242); prefill TP4 on 1021 GPUs 0-3, decode TP8 on 1019, both with
+`--disable-hybrid-kv-cache-manager --dyn-tool-call-parser gemma4 --dyn-reasoning-parser gemma4`.
+
+| Check | `DYN_PARSER_VERSION` auto | `DYN_PARSER_VERSION=2` |
+|---|---|---|
+| Turn after a tool response, thinking off: no `<\|channel>` in content, right answer | 3/3 | 3/3 |
+| Turn after a tool response, thinking on: `reasoning_content` filled, content clean | 3/3 | 3/3 |
+| `guided_json` parses | pass | pass |
+| `x-time-deployment` | `1.6.0-scicom-7a2e5fa3f-2026-10-17` | same |
+| Recall check, prefill TP4 -> decode TP8 across nodes (9 prompts, 1.6k-12.6k tokens) | 9/9 | |
+
+Same prefill TP4 -> decode TP8 on stock vLLM 0.31.0: `SPLIT region 5` assert, HTTP 500.
+Prod (`v1.3.0-gemma4-toolturn-reasoning.1` on job 784) gives the same answers and reasoning on the
+gemma4 checks. On a simple tool turn ("what is my bill") gemma-4 skips thinking on both builds, so
+the thinking-on check uses a turn that needs working out (the highest of three bills and the total).
+
+Rust: `postprocessor_parsing_stream` 109/109; `dynamo-llm` lib tests matching reasoning 123,
+thinking 65, isl 8, gemma4 1, raw_batch 1, all passing. vLLM connector tests for the patch: 64/64.
+`apply-vllm-patches.sh` patches a stock 0.31.0 install and reports "already applied" on a second run.
 
 ---
 
