@@ -3703,8 +3703,15 @@ async fn gemma4_without_enable_thinking_still_parses_channel_markers() {
             reasoning, content, ..
         } = drain_stream(output_stream).await;
 
-        assert_eq!(reasoning, "should stay plain");
-        assert_eq!(content, "final answer");
+        if reasoning_selector.is_some() {
+            assert_eq!(reasoning, "should stay plain", "{reasoning_selector:?}/{tool_selector:?}");
+            assert_eq!(content, "final answer", "{reasoning_selector:?}/{tool_selector:?}");
+        } else {
+            // Tool parser only: the legacy path has no reasoning parser, so the text
+            // passes through untouched. Deployments set both parsers to gemma4.
+            assert!(reasoning.is_empty(), "{reasoning_selector:?}/{tool_selector:?}");
+            assert_eq!(content, text, "{reasoning_selector:?}/{tool_selector:?}");
+        }
     }
 }
 

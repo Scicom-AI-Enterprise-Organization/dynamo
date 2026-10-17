@@ -129,8 +129,9 @@ mod tests {
         );
         let mut disabled = request(json!("auto"));
         disabled.thinking = Some(json!(false));
+        // Scicom: gemma4 reasoning is never disabled by the request (tool-turn markers).
         assert!(
-            apply_request_tool_call_parsing_options(options, &disabled)
+            !apply_request_tool_call_parsing_options(options, &disabled)
                 .unwrap()
                 .reasoning_disabled
         );
@@ -217,11 +218,8 @@ mod tests {
                     let result = apply_request_tool_call_parsing_options(options, &req).unwrap();
                     assert_eq!(
                         result.reasoning_disabled,
-                        if family == "gemma4" {
-                            thinking != Some(true)
-                        } else {
-                            thinking == Some(false)
-                        },
+                        // Scicom: gemma4 is never disabled by the request.
+                        family != "gemma4" && thinking == Some(false),
                         "{selector} {tool:?} {reasoning:?} {thinking:?}"
                     );
                 }

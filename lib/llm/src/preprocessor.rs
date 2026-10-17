@@ -6815,7 +6815,10 @@ impl OpenAIPreprocessor {
         if let Some(family) = unified_family {
             let thinking = dynamo_renderer::thinking_bool_from_args(chat_template_args.as_ref());
             return match family {
-                "gemma4" => thinking != Some(true),
+                // Scicom: never gated on enable_thinking, same as the legacy path in
+                // is_reasoning_disabled_by_request: with thinking off the model still
+                // writes `<|channel>thought\n<channel|>` on a turn after a tool response.
+                "gemma4" => false,
                 "deepseek_v4" | "deepseek_v41" => {
                     !Self::deepseek_renderer_reasoning_enabled(chat_template_args.as_ref(), true)
                 }
