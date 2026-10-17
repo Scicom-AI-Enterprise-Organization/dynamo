@@ -56,7 +56,7 @@ All three are in Dynamo's frontend (the preprocessor and response parsing), not 
 
 ### `1.6.0-scicom-gemma4-toolturn-reasoning`
 
-**Every Scicom change on upstream `main` at `f95c85b` (2026-10-16), the commit behind the `ai-dynamo` 1.6.0.dev20261016 nightly, which pins vLLM 0.31.0.** Created 2026-10-17 through PR #1 (merge commit `197b12e`, so the cherry-pick ids below stay valid). Released as `v1.6.0-nightly-20261016-gemma4-hetero-tp.1` (prerelease, because the base is a nightly).
+**Every Scicom change on upstream `main` at `f95c85b` (2026-10-16), the commit behind the `ai-dynamo` 1.6.0.dev20261016 nightly, which pins vLLM 0.31.0.** Created 2026-10-17 through PR #1 (merge commit `197b12e`, so the cherry-pick ids below stay valid). Released as `v1.6.0-nightly-20261016-gemma4-hetero-tp.1` (prerelease, because the base is a nightly); its image is in ECR `scicom/dynamo-vllm-runtime` under the same tag.
 
 | 1.6.0 commit | From | What changed in the port |
 |---|---|---|
@@ -162,6 +162,7 @@ They are labelled `model` and `isl_bucket` (`0-512`, `513-1024`, … `16385+`), 
 | **tm-h20** (Slurm, bare metal, Singapore) | `v1.3.0-gemma4-toolturn-reasoning.1` @ `c8893ec` | `deploy/scicom/build-bindings.sh`: editable install, `_core.abi3.so` swapped by rename (never overwrite a mapped `.so`) | Bump `TIME_DEPLOYMENT` in the sbatch, restart the job. Record changes in `ucc_slurm-ui-job` `jobs/tm-h20/README.md`. |
 | **TM B300 Bangkok** (k3s, Dynamo operator 1.5.0), workers | `1.5.0-scicom-gemma4-toolturn-reasoning` @ `3e45671` | `AIES-Infra/b300-bangkok` app `dynamo-scicom-image`: a BuildKit Job on node-1 builds manylinux wheels over `vllm-runtime:1.5.0` and imports `localhost/scicom/dynamo-vllm-runtime:<tag>` into containerd | GitOps: new Job per commit (Rust tests gate the build), then the image tag in `argocd/apps/gemma4-31b-scicom`. `runtimeVersionOverride: "1.5.0"` is required, because the tag's semver sorts below 1.5.0. |
 | **TM B300 Bangkok**, frontend | `feat/prom-metrics-for-bucketing` @ `85aff69` | same | same; `DYN_METRICS_ISL_BUCKETS` set on the frontend |
+| **ECR (AIES)**, image of the 1.6.0 release | `865626945255.dkr.ecr.ap-southeast-5.amazonaws.com/scicom/dynamo-vllm-runtime:v1.6.0-nightly-20261016-gemma4-hetero-tp.1` (= `1.6.0-scicom-gemma4-hetero-tp-197b12e`), digest `sha256:36a9fb9d…` | `AIES-Infra/b300-bangkok` `dynamo-scicom-image` Job `build-dynamo-vllm-runtime-197b12e` over `vllm/vllm-openai:v0.31.0-x86_64-cu129-ubuntu2404` (no `vllm-runtime:1.6.0` exists yet), then `ctr push` from node-1 | Repository created 2026-10-17 with the AWS CLI (not in Terraform yet). Push a new tag per release. |
 | **tm-h20 test nodes** 1021 (prefill TP4) -> 1019 (decode TP8), not prod | `1.6.0-scicom-gemma4-toolturn-reasoning` @ `7a2e5fa` | `build-bindings.sh` into the venv `/mnt/data/dynamo-hetero/venv` (vLLM 0.31.0 cu129) + `apply-vllm-patches.sh` | Started by hand, own etcd :2399 / NATS :4242 / frontend :8030 |
 
 ## Known issues (1.3.0 and 1.5.0 lines, not fixed; not re-tested on 1.6.0)
