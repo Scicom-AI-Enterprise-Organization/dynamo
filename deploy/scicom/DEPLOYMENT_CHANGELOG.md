@@ -17,7 +17,8 @@ The same fixes on upstream `main` at `f95c85b41` (2026-10-16, the commit behind 
 `ai-dynamo` 1.6.0.dev20261016 nightly; there is no plain v1.6.0 tag yet), which pins
 vLLM 0.31.0. The reason for the move is the NIXL patch below: it lets a gemma-4 prefill
 and decode run with different TP sizes, and it applies to vLLM 0.31.0 but not to 0.28.0.
-Each commit is a `cherry-pick -x` of its 1.5.0 commit.
+Each commit is a `cherry-pick -x` of its 1.5.0 commit, including the two of
+`feat/prom-metrics-for-bucketing`, so this branch carries every Scicom change.
 
 | 1.5.0 commit | 1.6.0 commit | On 1.6.0 |
 |---|---|---|
@@ -28,6 +29,7 @@ Each commit is a `cherry-pick -x` of its 1.5.0 commit.
 | `64398fe2e` tests | `92dcecc85e` | Kept next to upstream's new tests at the end of `postprocessor_parsing_stream.rs`. |
 | `7ff366d43`, `43ec6d3d0`, `3e4567125` build and docs | `8eff15d1ab`, `2b6a0c8e74`, `929e907e1f` | Unchanged. |
 | (new) | `0780d7527d` | vLLM 0.31.0 NIXL patch for prefill/decode TP mismatch, see below. |
+| `c21fa44d9`, `85aff69ec` (`feat/prom-metrics-for-bucketing`) | `a98672d367`, `067bd86e1c` | Ported. Upstream renamed the histogram bucket variables to `DYN_METRICS_*` and kept `DYN_HISTOGRAM_*` as a deprecated fallback; `DYN_METRICS_ISL_BUCKETS` sits next to them. |
 
 ### Prefill and decode with different TP (gemma-4)
 
