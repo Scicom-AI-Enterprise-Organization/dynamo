@@ -11,6 +11,41 @@ so keep `TIME_DEPLOYMENT` in the sbatch in step with the `.so` you actually buil
 
 ---
 
+## Branch `1.6.0-scicom-gemma4-toolturn-reasoning`
+
+The same fixes on upstream `main` at `f95c85b41` (2026-10-16, the commit behind the
+`ai-dynamo` 1.6.0.dev20261016 nightly; there is no plain v1.6.0 tag yet), which pins
+vLLM 0.31.0. The reason for the move is the NIXL patch below: it lets a gemma-4 prefill
+and decode run with different TP sizes, and it applies to vLLM 0.31.0 but not to 0.28.0.
+Each commit is a `cherry-pick -x` of its 1.5.0 commit.
+
+| 1.5.0 commit | 1.6.0 commit | On 1.6.0 |
+|---|---|---|
+| `1d92aee09` `x-time-deployment` | `3ce890ebd4` | Unchanged. |
+| `5b686115e` defect 1 | `3afdddf3d3` | Ported. Upstream still keeps gemma4 reasoning opt-in. The gate change applied as is; upstream's new `all_unified_families_honor_normalized_request_controls_for_all_selector_shapes` test and its gemma4 selector-shape test now assert that the parser stays on whatever `enable_thinking` says. |
+| `ec9006825` defect 3 | `dcc809d7c9` | Upstream now arms the gemma4 parser itself when the prompt ends in `<\|channel>thought` or `<\|channel>`. Upstream's arm is kept, with the `gemma-4` alias added; our test cases are kept. |
+| `362a598b7` defect 3 priming | `af092ed2fc` | Unchanged. |
+| `64398fe2e` tests | `92dcecc85e` | Kept next to upstream's new tests at the end of `postprocessor_parsing_stream.rs`. |
+| `7ff366d43`, `43ec6d3d0`, `3e4567125` build and docs | `8eff15d1ab`, `2b6a0c8e74`, `929e907e1f` | Unchanged. |
+| (new) | `0780d7527d` | vLLM 0.31.0 NIXL patch for prefill/decode TP mismatch, see below. |
+
+### Prefill and decode with different TP (gemma-4)
+
+`patches/vllm-0.31.0-nixl-per-region-kv-heads.patch`, applied with
+`apply-vllm-patches.sh <venv python>`; details in `patches/README.md`. Stock vLLM rejects a
+prefill TP4 to decode TP8 handshake on gemma-4's first global layer (`SPLIT region 5`), because
+the NIXL connector sizes every KV region with the model-wide 16 KV heads and the 10 global layers
+have 4. Both engines need `--disable-hybrid-kv-cache-manager`, which costs KV capacity: the
+sliding layers keep the whole context.
+
+### Validated on tm-h20 (2026-10-17)
+
+Built on 1021 with `build-bindings.sh`, installed into a test venv (vLLM 0.31.0 cu129, torch 2.13
+cu129), test frontend on 1021 with its own etcd (:2399) and NATS (:4242), prefill TP4 on 1021,
+decode TP8 on 1019. Results are filled in after the run.
+
+---
+
 ## Branch `1.5.0-scicom-gemma4-toolturn-reasoning`
 
 The same fixes rebased onto upstream tag `v1.5.0` (vLLM 0.28.0, `dynamo-parsers` 8.1.0),
