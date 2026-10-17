@@ -724,6 +724,11 @@ fn drain_deferred_reasoning(state: &mut ChoiceReasoningState) -> (Option<String>
     }
 }
 
+/// Gemma 4's reasoning opener, replayed into the parser when the chat template
+/// left it dangling at the end of the prompt. Must match START_TOKEN plus the
+/// `thought\n` role label used by dynamo-parsers' Gemma4ReasoningParser.
+const GEMMA4_INJECTED_OPENER: &str = "<|channel>thought\n";
+
 struct ReasoningState {
     stream: Pin<Box<dyn Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send>>,
     parser_name: String,
@@ -6682,7 +6687,11 @@ impl OpenAIPreprocessor {
                     .rev()
                     .all(|c| suffix.next() == Some(c))
             }
-            Some("gemma4") => {
+            // Gemma 4 opens `<|channel>thought` without its `<channel|>` close on a turn
+            // after a tool response with thinking on, so the completion starts inside the
+            // thought channel. Upstream arms this itself now; the fork adds the `gemma-4`
+            // alias it has accepted since 1.3.0.
+            Some("gemma4") | Some("gemma-4") => {
                 prompt.ends_with("<|channel>thought") || prompt.ends_with("<|channel>")
             }
             Some("muse" | "muse_glimmer") => prompt.ends_with("assistant to=self<|message|>"),
@@ -6806,7 +6815,10 @@ impl OpenAIPreprocessor {
         if let Some(family) = unified_family {
             let thinking = dynamo_renderer::thinking_bool_from_args(chat_template_args.as_ref());
             return match family {
-                "gemma4" => thinking != Some(true),
+                // Scicom: never gated on enable_thinking, same as the legacy path in
+                // is_reasoning_disabled_by_request: with thinking off the model still
+                // writes `<|channel>thought\n<channel|>` on a turn after a tool response.
+                "gemma4" => false,
                 "deepseek_v4" | "deepseek_v41" => {
                     !Self::deepseek_renderer_reasoning_enabled(chat_template_args.as_ref(), true)
                 }
@@ -6850,7 +6862,45 @@ impl OpenAIPreprocessor {
                 | "deepseek_v41" | "minimax_m2",
             ) => !Self::deepseek_renderer_reasoning_enabled(chat_template_args, true),
             Some("gemma4") | Some("gemma-4") => {
-                dynamo_renderer::thinking_bool_from_args(chat_template_args) != Some(true)
+                // Deliberately NOT gated on enable_thinking.
+                //
+                // The premise for gating -- that with enable_thinking=false the
+                // model emits no `<|channel>` markers -- does not hold for the
+                // canonical Gemma 4 chat template. Its `add_generation_prompt`
+                // block only prefills a closed thought channel on the branch
+                // where the previous message is neither a tool_response nor a
+                // tool_call:
+                //
+                //   {%- if ns.prev_message_type != 'tool_response'
+                //          and ns.prev_message_type != 'tool_call' -%}
+                //       {{- '<|turn>model\n' -}}
+                //       {%- if not enable_thinking -%}
+                //           {{- '<|channel>thought\n<channel|>' -}}
+                //
+                // On a turn that ends in a tool response with enable_thinking
+                // false, both arms are skipped, the template emits nothing, and
+                // the model produces `<|channel>thought\n<channel|>` itself.
+                // parser_requires_special_tokens() has already forced
+                // skip_special_tokens=false for gemma4, so disabling the parser
+                // here leaves those delimiters with nothing to consume them and
+                // they surface in `content`. Measured 200/200 on
+                // google/gemma-4-31B-it with a billing tool-response turn.
+                //
+                // Leaving the parser enabled is safe in the opposite case:
+                // Gemma4ReasoningParser::extract_reasoning returns
+                // (None, model_output) when neither delimiter is present, so
+                // when thinking really is off it is a no-op. This matches
+                // upstream vLLM, which never gates its reasoning parser on
+                // enable_thinking (vllm/entrypoints/serve/render/serving.py).
+                //
+                // See https://github.com/ai-dynamo/dynamo/issues/8636 for the
+                // gating rationale that still applies to the other families.
+                //
+                // Upstream #13061 (1.4.x) went the other way and made gemma4
+                // reasoning opt-in, keeping the markers as plain content unless
+                // enable_thinking=true. On tool-response turns that is exactly the
+                // customer-visible leak above, so this fork keeps the parser on.
+                false
             }
             Some("mistral") => !Self::mistral_reasoning_enabled(chat_template_args),
             Some("minimax_m3") | Some("minimax-m3") => {
@@ -6952,6 +7002,29 @@ impl OpenAIPreprocessor {
                                         as Box<dyn ReasoningParser>;
                                 if prompt_injected_reasoning {
                                     parser.set_in_reasoning(true);
+                                    // set_in_reasoning is a no-op for gemma4:
+                                    // Gemma4ReasoningParser (dynamo-parsers, unchanged
+                                    // from 3.1.0 through 8.1.0) never overrides the
+                                    // trait's empty default, so the call above cannot
+                                    // arm it and a tool-response turn's whole
+                                    // chain-of-thought would reach `content`.
+                                    //
+                                    // Prime it instead by replaying the opener the chat
+                                    // template left at the end of the prompt: the
+                                    // parser finds START_TOKEN at offset 0, enters the
+                                    // span and consumes the `thought\n` label, so the
+                                    // model's first delta (mid chain-of-thought, no
+                                    // marker of its own) is reasoning and the span
+                                    // closes on `<channel|>`. The synthetic chunk's
+                                    // result carries no model output and is dropped.
+                                    // Safe because prompt_injected_reasoning is only
+                                    // true when the prompt ends with that opener.
+                                    if matches!(parser_name.as_str(), "gemma4" | "gemma-4") {
+                                        let _ = parser.parse_reasoning_streaming_incremental(
+                                            GEMMA4_INJECTED_OPENER,
+                                            &[],
+                                        );
+                                    }
                                 }
                                 ChoiceReasoningState {
                                     parser,
@@ -12537,6 +12610,42 @@ mod tests {
                 "legacy no-parser detection",
             ),
             (Some("minimax_m3"), None, false, "no prompt"),
+            // Gemma 4: tool-response turn with thinking on leaves the thought channel
+            // open, so the completion starts inside it with no start tag of its own.
+            (
+                Some("gemma4"),
+                Some("<|tool_response>...<tool_response|><|channel>thought\n"),
+                true,
+                "gemma4 tool-response turn opens an unclosed thought channel",
+            ),
+            (
+                Some("gemma-4"),
+                Some("<|tool_response>...<tool_response|><|channel>thought\n"),
+                true,
+                "gemma-4 alias behaves identically",
+            ),
+            // Plain turn, thinking on: template stops at `<|turn>model` and the model
+            // emits its own `<|channel>thought`, so the parser must NOT be pre-armed.
+            (
+                Some("gemma4"),
+                Some("<|turn>model\n"),
+                false,
+                "gemma4 plain turn is not prompt-injected",
+            ),
+            // Thinking off: the template closes the channel itself, so there is no
+            // reasoning to consume and the parser must not start inside one.
+            (
+                Some("gemma4"),
+                Some("<|turn>model\n<|channel>thought\n<channel|>"),
+                false,
+                "gemma4 pre-closed thought channel means not in reasoning",
+            ),
+            (
+                Some("gemma4"),
+                Some("...<think>\n"),
+                false,
+                "gemma4 must not use generic <think>",
+            ),
         ];
 
         for (parser, prompt, expected, desc) in cases {
@@ -12803,8 +12912,10 @@ mod tests {
     }
 
     #[test]
-    fn test_gemma4_default_thinking_mode_controls_reasoning_parser() {
-        for (mode, expected_disabled) in [("enabled", false), ("disabled", true)] {
+    fn test_gemma4_default_thinking_mode_keeps_reasoning_parser_on() {
+        // The gemma4 parser is never gated on thinking mode: with thinking off the
+        // model still writes `<|channel>thought\n<channel|>` on tool-response turns.
+        for (mode, expected_disabled) in [("enabled", false), ("disabled", false)] {
             let runtime_config = runtime_config_with_default_thinking_mode(mode);
             let mut request = chat_request_with_args(None);
 
@@ -15126,8 +15237,8 @@ mod tests {
             (
                 Some("gemma4"),
                 Some(&enable_thinking_false),
-                true,
-                "gemma4 + enable_thinking=false → disabled",
+                false,
+                "gemma4 + enable_thinking=false → still enabled (tool-turn markers)",
             ),
             (
                 Some("gemma4"),
@@ -15138,20 +15249,20 @@ mod tests {
             (
                 Some("gemma4"),
                 None,
-                true,
-                "gemma4 + no args → disabled (reasoning is opt-in)",
+                false,
+                "gemma4 + no args → enabled (never gated on enable_thinking)",
             ),
             (
                 Some("gemma-4"),
                 Some(&enable_thinking_false),
-                true,
-                "gemma-4 (hyphen alias) + enable_thinking=false → disabled",
+                false,
+                "gemma-4 (hyphen alias) + enable_thinking=false → still enabled",
             ),
             (
                 Some("gemma-4"),
                 None,
-                true,
-                "gemma-4 (hyphen alias) + no args → disabled (reasoning is opt-in)",
+                false,
+                "gemma-4 (hyphen alias) + no args → enabled",
             ),
             (Some("mistral"), None, true, "mistral + no args → disabled"),
             (

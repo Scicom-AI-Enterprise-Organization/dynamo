@@ -88,6 +88,10 @@ Every Dynamo process reads its own environment at startup, so set these on each 
   **Operator preset:** `8000` on frontend pods.
 </ParamField>
 
+<ParamField path="DYN_METRICS_ISL_BUCKETS" type="string">
+  Comma-separated input-sequence-length bucket upper bounds, in tokens, inclusive, e.g. `1024,2048,4096,8192,16384`. When set, the frontend also records its latency and size KPIs per bucket as the `dynamo_frontend_*_by_isl*` histograms, labeled `isl_bucket` (`0-1024`, `1025-2048`, …, `16385+`). Unset or empty: those histograms are not registered. Invalid values (non-integers, `0`, more than 32 bounds) log a warning and leave them off. See [Input-length buckets](metrics-catalog.mdx#input-length-buckets).
+</ParamField>
+
 <ParamField path="NIXL_TELEMETRY_ENABLE" type="string" default="n">
   Enables [NIXL](https://github.com/ai-dynamo/nixl) telemetry. NIXL metrics track KV cache and embedding data transfers and are populated only during disaggregated serving or multimodal embedding transfers.
 
