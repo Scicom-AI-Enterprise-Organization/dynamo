@@ -1,0 +1,582 @@
+diff --git a/tests/v1/kv_connector/unit/test_nixl_connector.py b/tests/v1/kv_connector/unit/test_nixl_connector.py
+--- a/tests/v1/kv_connector/unit/test_nixl_connector.py
++++ b/tests/v1/kv_connector/unit/test_nixl_connector.py
+@@ -1437,6 +1437,79 @@
+         "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
+         FakeNixlWrapper,
+     )
++    @pytest.mark.parametrize("advertise_heads", [True, False])
++    def test_handshake_per_region_kv_heads_hetero_tp(
++        self, default_vllm_config, dist_init, advertise_heads
++    ):
++        """Layers with different KV head counts under D_TP > P_TP (Gemma 4).
++
++        Model-wide 16 KV heads, but the second region (a global layer) has only
++        4. At P_TP=4 -> D_TP=8 the sliding region halves its block while the
++        global region keeps one head per rank on both sides. With per-region
++        heads advertised the handshake validates; a peer that does not
++        advertise them falls back to the model-wide split and is rejected.
++        """
++        block_size = 16  # 0.31.0 tests have no maybe_update_block_size (XPU-only 64)
++        vllm_config = create_vllm_config(block_size=block_size)
++
++        with patch(
++            "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.get_tensor_model_parallel_world_size",  # noqa: E501
++            return_value=8,
++        ):
++            connector = NixlConnector(
++                vllm_config,
++                KVConnectorRole.WORKER,
++                make_kv_cache_config(block_size=block_size),
++            )
++            connector.connector_worker = FakeNixlConnectorWorker(
++                vllm_config, connector.engine_id, hand_shake_latency=0
++            )
++            worker = connector.connector_worker
++
++            worker.transfer_topo.total_num_kv_heads = 16
++            worker.transfer_topo.local_physical_heads = 2
++            worker.kv_cache_layout = "LBHNC"
++
++            sliding_len = 2 * 256 * worker.block_size  # 2 heads/rank
++            global_len = 1 * 512 * worker.block_size  # 1 head/rank
++            worker.block_len_per_layer = [sliding_len, global_len]
++            worker.block_stride_per_layer = [sliding_len, global_len]
++            worker._region_is_mla = [False, False]
++            worker.region_kv_heads = [2, 1]
++            worker.region_num_blocks = [1, 1]
++            worker.region_group_ids = [0, 0]
++            worker.num_regions = 2
++            worker.num_blocks = 1
++            worker.dst_num_blocks[worker.engine_id] = worker.num_blocks
++
++            remote_lens = [2 * sliding_len, global_len]
++            meta = NixlAgentMetadata(
++                engine_id=FakeNixlConnectorWorker.REMOTE_ENGINE_ID,
++                agent_metadata=FakeNixlWrapper.AGENT_METADATA,
++                kv_caches_base_addr=[0, 0x100000],
++                device_id=0,
++                num_blocks=1,
++                block_lens=remote_lens,
++                block_strides=remote_lens,
++                kv_cache_layout="LBHNC",
++                block_size=worker.block_size,
++                ssm_sizes=(0, 0),
++                attn_backend_name=worker.backend_name,
++                physical_blocks_per_logical_kv_block=1,
++                region_num_blocks=[1, 1],
++                region_kv_heads=[4, 1] if advertise_heads else None,
++            )
++
++            if advertise_heads:
++                worker.add_remote_agent(meta, remote_tp_size=4)
++            else:
++                with pytest.raises(AssertionError, match="SPLIT region 1"):
++                    worker.add_remote_agent(meta, remote_tp_size=4)
++
++    @patch(
++        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
++        FakeNixlWrapper,
++    )
+     def test_handshake_rejects_wrong_block_len_without_gqa_replication(
+         self, default_vllm_config, dist_init
+     ):
+diff --git a/tests/v1/kv_connector/unit/test_tp_mapping.py b/tests/v1/kv_connector/unit/test_tp_mapping.py
+--- a/tests/v1/kv_connector/unit/test_tp_mapping.py
++++ b/tests/v1/kv_connector/unit/test_tp_mapping.py
+@@ -17,6 +17,7 @@
+ from vllm.distributed.kv_transfer.kv_connector.utils import TransferTopology
+ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
+     TPMapping,
++    compute_region_head_offset,
+     compute_tp_mapping,
+ )
+ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
+@@ -314,3 +315,171 @@
+     else:
+         with pytest.raises(ValueError, match="KV-head sharding boundary"):
+             worker._validate_csa_linear_tp_layout(remote_tp)
++
++
++# ======================================================================
++# Per-region KV head counts (layers with different KV heads, e.g. Gemma 4)
++# ======================================================================
++
++
++@pytest.mark.parametrize(
++    ("local_tp", "remote_tp", "local_heads", "remote_heads", "expected"),
++    [
++        # Gemma 4 sliding layers, 16 KV heads, P_TP=4 -> D_TP=8: 2-way split.
++        (8, 4, 2, 4, [0, 2, 0, 2, 0, 2, 0, 2]),
++        # Gemma 4 global layers, 4 KV heads, P_TP=4 -> D_TP=8: replicated on D,
++        # so every rank reads its source rank's single head whole.
++        (8, 4, 1, 1, [0] * 8),
++        # 4 KV heads, P_TP=2 (2 heads/rank) -> D_TP=8 (replicated, 1 head/rank).
++        (8, 2, 1, 2, [0, 0, 1, 1, 0, 0, 1, 1]),
++        # Plain GQA, 8 KV heads, P_TP=1 -> D_TP=4.
++        (4, 1, 2, 8, [0, 2, 4, 6]),
++        # Equal TP is always a whole-block read.
++        (4, 4, 4, 4, [0, 0, 0, 0]),
++    ],
++)
++def test_compute_region_head_offset(
++    local_tp, remote_tp, local_heads, remote_heads, expected
++):
++    offsets = [
++        compute_region_head_offset(
++            local_tp_rank=rank,
++            local_tp_size=local_tp,
++            remote_tp_size=remote_tp,
++            source_rank=rank * remote_tp // local_tp,
++            local_heads=local_heads,
++            remote_heads=remote_heads,
++        )
++        for rank in range(local_tp)
++    ]
++    assert offsets == expected
++
++
++def test_compute_region_head_offset_rejects_unmappable():
++    with pytest.raises(ValueError, match="not a multiple"):
++        compute_region_head_offset(0, 4, 2, 0, local_heads=2, remote_heads=3)
++    with pytest.raises(ValueError, match="D_TP >= P_TP"):
++        compute_region_head_offset(0, 2, 4, 0, local_heads=2, remote_heads=1)
++    # Wrong source rank: rank 3 of 4 needs head 3, rank 0 of P_TP=2 holds 0-1.
++    with pytest.raises(ValueError, match="needs KV heads"):
++        compute_region_head_offset(3, 4, 2, 0, local_heads=1, remote_heads=2)
++
++
++_GEMMA4_SLIDING_LEN = 2 * 1024  # 2 sliding heads per D rank
++_GEMMA4_GLOBAL_LEN = 1 * 2048  # 1 global head per D rank (head_dim 512)
++
++
++def _make_per_region_worker(
++    tp_rank: int,
++    tp_size: int,
++    remote_tp_size: int,
++    local_region_heads: list[int],
++    block_lens: list[int],
++):
++    worker = object.__new__(NixlConnectorWorker)
++    worker.use_mla = False
++    worker._group_spec_types = (FullAttentionSpec,)
++    worker._transfer_layer_region_indices = ()
++    worker.block_len_per_layer = list(block_lens)
++    worker._region_is_mla = [False] * len(block_lens)
++    worker.region_kv_heads = list(local_region_heads)
++    worker.transfer_topo = SimpleNamespace(
++        tp_rank=tp_rank,
++        tp_size=tp_size,
++        total_num_kv_heads=16,
++        local_physical_heads=max(1, 16 // tp_size),
++        get_engine_info=lambda *_: SimpleNamespace(remote_tp_size=remote_tp_size),
++    )
++    return worker
++
++
++def _gemma4_remote_meta(region_kv_heads, block_lens):
++    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
++        NixlAgentMetadata,
++    )
++
++    return NixlAgentMetadata(
++        engine_id="remote",
++        agent_metadata=b"",
++        kv_caches_base_addr=[0x10000, 0x90000],
++        device_id=0,
++        num_blocks=4,
++        block_lens=list(block_lens),
++        block_strides=list(block_lens),
++        kv_cache_layout="LBHNC",
++        block_size=16,
++        ssm_sizes=(0, 0),
++        attn_backend_name="FLASH_ATTN",
++        physical_blocks_per_logical_kv_block=1,
++        region_kv_heads=region_kv_heads,
++    )
++
++
++@pytest.mark.parametrize("tp_rank", range(8))
++def test_build_fa_remote_per_region_heads_gemma4(tp_rank):
++    """P_TP=4 -> D_TP=8 with a 16-head sliding region and a 4-head global one.
++
++    The sliding region reads this rank's 2-head half of the source block; the
++    global region reads the source rank's whole single-head block.
++    """
++    worker = _make_per_region_worker(
++        tp_rank,
++        tp_size=8,
++        remote_tp_size=4,
++        local_region_heads=[2, 1],
++        block_lens=[_GEMMA4_SLIDING_LEN, _GEMMA4_GLOBAL_LEN],
++    )
++    remote_lens = [2 * _GEMMA4_SLIDING_LEN, _GEMMA4_GLOBAL_LEN]
++    meta = _gemma4_remote_meta([4, 1], remote_lens)
++    plan = _compute_mapping(tp_rank=tp_rank, tp_size=8, remote_tp_size=4, num_kv_heads=16)
++
++    descs = worker._build_fa_remote(plan, meta, block_size_ratio=1).tolist()
++
++    sliding_offset = (tp_rank % 2) * _GEMMA4_SLIDING_LEN
++    # 0.31.0 writes one [addr, len, device] descriptor per block (main uses strided ones).
++    assert descs == [
++        [0x10000 + sliding_offset + k * remote_lens[0], _GEMMA4_SLIDING_LEN, 0]
++        for k in range(4)
++    ] + [[0x90000 + k * remote_lens[1], _GEMMA4_GLOBAL_LEN, 0] for k in range(4)]
++
++
++def test_build_fa_remote_legacy_peer_keeps_model_wide_split():
++    """A peer without region_kv_heads keeps the model-wide behaviour."""
++    worker = _make_per_region_worker(
++        1, 8, 4, [2, 1], [_GEMMA4_SLIDING_LEN, _GEMMA4_GLOBAL_LEN]
++    )
++    meta = _gemma4_remote_meta(None, [2 * _GEMMA4_SLIDING_LEN, _GEMMA4_GLOBAL_LEN])
++    plan = _compute_mapping(tp_rank=1, tp_size=8, remote_tp_size=4, num_kv_heads=16)
++    descs = worker._build_fa_remote(plan, meta, block_size_ratio=1).tolist()
++    # Both regions get the model-wide 2-way offset (wrong for the global one,
++    # which is why the handshake validation rejects this pairing).
++    assert descs[1][0] == 0x90000 + _GEMMA4_GLOBAL_LEN
++
++
++def test_region_head_offsets_rejects_mixed_hma_region():
++    worker = _make_per_region_worker(0, 8, 4, [-1], [_GEMMA4_SLIDING_LEN])
++    meta = _gemma4_remote_meta([-1], [2 * _GEMMA4_SLIDING_LEN])
++    meta.kv_caches_base_addr = [0x10000]
++    with pytest.raises(NotImplementedError, match="disable-hybrid-kv-cache-manager"):
++        worker._region_head_offsets(meta, remote_tp_size=4)
++
++
++def test_region_head_offsets_rejects_p_gt_d_with_mixed_heads():
++    # P_TP=8 -> D_TP=4: global region has 1 head per rank on both sides, which
++    # differs from the model-wide 4 -> 2 heads per rank.
++    worker = _make_per_region_worker(0, 4, 8, [4, 1], [4096, 2048])
++    meta = _gemma4_remote_meta([2, 1], [2048, 2048])
++    with pytest.raises(NotImplementedError, match="prefill TP > decode TP"):
++        worker._region_head_offsets(meta, remote_tp_size=8)
++
++
++def test_region_head_offsets_uniform_heads_matches_model_wide():
++    """For a uniform model the per-region offsets equal rank_offset_factor."""
++    for tp_rank in range(4):
++        worker = _make_per_region_worker(tp_rank, 4, 2, [4, 4], [4096, 4096])
++        meta = _gemma4_remote_meta([8, 8], [8192, 8192])
++        plan = _compute_mapping(
++            tp_rank=tp_rank, tp_size=4, remote_tp_size=2, num_kv_heads=16
++        )
++        offsets = worker._region_head_offsets(meta, remote_tp_size=2)
++        assert offsets == [plan.rank_offset_factor * 4] * 2
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
+@@ -55,6 +55,7 @@
+     TPMapping,
+     _is_attention_spec,
+     _is_ssm_spec,
++    compute_region_head_offset,
+     compute_tp_mapping,
+ )
+ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
+@@ -79,6 +80,7 @@
+ from vllm.utils.network_utils import make_zmq_path
+ from vllm.utils.torch_utils import async_tensor_h2d
+ from vllm.v1.kv_cache_interface import (
++    AttentionSpec,
+     CircularBufferSpec,
+     FullAttentionSpec,
+     KpoolTailSpec,
+@@ -411,6 +413,85 @@
+         """
+         return region_idx < len(self._region_is_mla) and self._region_is_mla[region_idx]
+ 
++    def _region_head_offsets(
++        self, nixl_agent_meta: NixlAgentMetadata, remote_tp_size: int
++    ) -> list[int | None] | None:
++        """Per-region head offsets for hetero TP, in remote region order.
++
++        Uses each region's own KV heads per rank (advertised by both sides)
++        instead of the model-wide ``total_num_kv_heads``, so layers with fewer
++        KV heads (e.g. Gemma 4 global layers) are split by their own count.
++        Returns None to keep the model-wide behaviour: equal TP, MLA, or a peer
++        that does not advertise per-region heads. An entry is None for a region
++        that is not head-sharded (SSM, scratch, MLA).
++        """
++        assert self.transfer_topo is not None
++        topo = self.transfer_topo
++        remote_heads = nixl_agent_meta.region_kv_heads
++        local_region_heads = getattr(self, "region_kv_heads", None)
++        if (
++            remote_heads is None
++            or self.use_mla
++            or topo.tp_size == remote_tp_size
++            or not local_region_heads
++            or len(local_region_heads) != len(self.block_len_per_layer)
++        ):
++            return None
++        local_regions = list(
++            self._transfer_layer_region_indices or range(len(self.block_len_per_layer))
++        )
++        if len(remote_heads) != len(local_regions):
++            return None  # region-count mismatch is reported by the caller
++
++        model_local = topo.local_physical_heads
++        model_remote = max(1, topo.total_num_kv_heads // remote_tp_size)
++        source_rank = topo.tp_rank * remote_tp_size // topo.tp_size
++        offsets: list[int | None] = []
++        for i, region_idx in enumerate(local_regions):
++            lh, rh = self.region_kv_heads[region_idx], remote_heads[i]
++            if lh == 0 and rh == 0:
++                offsets.append(None)
++                continue
++            if lh < 0 or rh < 0:
++                raise NotImplementedError(
++                    "NIXL heterogeneous TP cannot re-shard a KV region shared by "
++                    "layers with different KV head counts (hybrid KV cache "
++                    f"manager, region {region_idx}). Use matching TP sizes, or "
++                    "start both prefill and decode with "
++                    "--disable-hybrid-kv-cache-manager."
++                )
++            if lh == 0 or rh == 0:
++                offsets.append(None)  # layer-type mismatch, caller reports it
++                continue
++            if topo.tp_size < remote_tp_size:
++                if (lh, rh) != (model_local, model_remote):
++                    raise NotImplementedError(
++                        "NIXL heterogeneous TP with prefill TP > decode TP does "
++                        "not support layers with different KV head counts "
++                        f"(region {region_idx}: local {lh} vs model {model_local}, "
++                        f"remote {rh} vs model {model_remote} heads per rank). "
++                        "Use decode TP >= prefill TP, or matching TP sizes."
++                    )
++                offsets.append(None)
++                continue
++            try:
++                offsets.append(
++                    compute_region_head_offset(
++                        local_tp_rank=topo.tp_rank,
++                        local_tp_size=topo.tp_size,
++                        remote_tp_size=remote_tp_size,
++                        source_rank=source_rank,
++                        local_heads=lh,
++                        remote_heads=rh,
++                    )
++                )
++            except ValueError as e:
++                raise RuntimeError(
++                    f"NIXL heterogeneous TP cannot map KV region {region_idx} "
++                    f"(local TP {topo.tp_size}, remote TP {remote_tp_size}): {e}"
++                ) from e
++        return offsets
++
+     def _set_region_layers(self, region_layers: list[list[str]]) -> None:
+         layer_names = [layer_name for region in region_layers for layer_name in region]
+         assert len(layer_names) == len(set(layer_names)), (
+@@ -912,6 +993,10 @@
+         # (MLA), False -> SPLIT (head-sharded full-attn). Mixed only for models
+         # combining both (e.g. GQA main + MLA Eagle-3 draft).
+         self._region_is_mla = list[bool]()
++        # Per-region physical KV heads per rank, 1:1 with block_len_per_layer
++        # (see NixlAgentMetadata.region_kv_heads). Lets hetero TP split each
++        # region by its own head count when layers differ (e.g. Gemma 4).
++        self.region_kv_heads = list[int]()
+         self._ssm_region_indices = list[int]()
+         # Regions holding a scratch cache (the CSA compressor circular buffer).
+         # Tracked explicitly because a scratch page shares its address with the
+@@ -1487,6 +1572,8 @@
+         track_region_layers = self._tracks_region_layers()
+         region_layers: list[list[str]] = []
+         packed_member_layouts: dict[str, tuple[int, int]] = {}
++        # Kept 1:1 with block_len_per_layer / _region_is_mla.
++        self.region_kv_heads = [0] * len(self.block_len_per_layer)
+ 
+         # K and V are packed into the content dim, so each attention layer is a
+         # single NIXL region whose block transfers as one unit. Mamba layers instead
+@@ -1541,6 +1628,13 @@
+             is_mla_region = isinstance(
+                 layer_spec, (MLAAttentionSpec, SlidingWindowMLASpec)
+             )
++            layer_kv_heads = (
++                layer_spec.num_kv_heads
++                if isinstance(layer_spec, AttentionSpec)
++                and not is_mla_region
++                and not isinstance(layer_spec, CircularBufferSpec)
++                else 0
++            )
+             logger.debug(
+                 "Registering layer %s with cache shape: %s", layer_name, cache.shape
+             )
+@@ -1706,6 +1800,10 @@
+                     region_index = seen_base_addresses.index(base_addr)
+                     assert region_mem_types[region_index] == mem_type
+                     self._region_is_mla[region_index] |= is_mla_region
++                    if self.region_kv_heads[region_index] != layer_kv_heads:
++                        # e.g. HMA sharing one tensor between a sliding layer and
++                        # a global layer with fewer KV heads.
++                        self.region_kv_heads[region_index] = -1
+                     if is_mla_region:
+                         self.block_len_per_layer[region_index] = block_len
+                         self.block_stride_per_layer[region_index] = block_stride
+@@ -1721,6 +1819,7 @@
+                     self.region_names.append(layer_name)
+                     self.region_num_blocks.append(num_blocks)
+                     self._region_is_mla.append(is_mla_region)
++                    self.region_kv_heads.append(layer_kv_heads)
+                     region_mem_types.append(mem_type)
+ 
+                 if track_region_layers:
+@@ -1877,6 +1976,7 @@
+             pcp_size=self.pcp_size,
+             region_members=self.region_members,
+             packed_member_layouts=packed_member_layouts,
++            region_kv_heads=self.region_kv_heads,
+         )
+         # Wrap metadata in payload with hash for defensive decoding
+         assert self.compat_hash is not None
+@@ -2086,6 +2186,12 @@
+         block_strides = nixl_agent_meta.block_strides
+         parts: list[np.ndarray] = []
+         use_layer_name_routing = bool(self._transfer_layer_region_indices)
++        head_offsets = None
++        if nixl_agent_meta.region_kv_heads is not None:
++            remote_tp_size = self.transfer_topo.get_engine_info(
++                nixl_agent_meta.engine_id
++            ).remote_tp_size
++            head_offsets = self._region_head_offsets(nixl_agent_meta, remote_tp_size)
+         for i, base_addr in enumerate(nixl_agent_meta.kv_caches_base_addr):
+             local_region = (
+                 self._transfer_layer_region_indices[i] if use_layer_name_routing else i
+@@ -2098,12 +2204,28 @@
+                 # ..using remote kv_block_len as transfer unit
+                 local_block_len = remote_kv_block_len
+ 
+-            # REPLICATE reads the whole block once at offset 0; SPLIT gathers
+-            # its head slice from `split_reads` remote ranks at a per-rank offset.
+-            num_reads = 1 if replicated else split_reads
+-            rank_offset = (
+-                0 if replicated else plan.rank_offset_factor * remote_kv_block_len
+-            )
++            head_offset = (
++                head_offsets[i]
++                if head_offsets is not None and not replicated
++                else None
++            )
++            if head_offset is not None:
++                # D_TP > P_TP with per-region head counts: one read of this
++                # region's own heads, at its own offset in the remote block. A
++                # region with as many heads per rank as the remote (e.g. Gemma 4
++                # global layers at P4 -> D8) reads the whole block.
++                num_reads = 1
++                rank_offset = head_offset * (
++                    remote_kv_block_len // self.region_kv_heads[local_region]
++                )
++            else:
++                # REPLICATE reads the whole block once at offset 0; SPLIT gathers
++                # its head slice from `split_reads` remote ranks at a per-rank
++                # offset.
++                num_reads = 1 if replicated else split_reads
++                rank_offset = (
++                    0 if replicated else plan.rank_offset_factor * remote_kv_block_len
++                )
+             local_block_len = local_block_len // num_reads
+ 
+             block_arange = np.arange(region_num_blocks[i], dtype=np.uint64)
+@@ -2633,12 +2755,25 @@
+                 remote_engine_id
+             )
+             total_kv_heads = self.transfer_topo.total_num_kv_heads
+-            local_heads = self.transfer_topo.local_physical_heads
+-            remote_heads = max(1, total_kv_heads // remote_tp_size)
++            model_local_heads = self.transfer_topo.local_physical_heads
++            model_remote_heads = max(1, total_kv_heads // remote_tp_size)
++            # Raises early with a clear message for unsupported layouts.
++            head_offsets = self._region_head_offsets(nixl_agent_meta, remote_tp_size)
+             for i, region_idx in enumerate(local_regions):
+                 local_len = self.block_len_per_layer[region_idx]
+                 replicated = model_replicated or self._is_region_replicated(region_idx)
+                 remote_len = nixl_agent_meta.block_lens[i]
++                local_heads, remote_heads = model_local_heads, model_remote_heads
++                if (
++                    head_offsets is not None
++                    and head_offsets[i] is not None
++                    and not replicated
++                ):
++                    # Validate against this region's own heads per rank.
++                    assert nixl_agent_meta.region_kv_heads is not None
++                    local_heads = self.region_kv_heads[region_idx]
++                    remote_heads = nixl_agent_meta.region_kv_heads[i]
++                    replicated = local_heads == remote_heads
+                 if replicated:
+                     assert local_len // block_size_ratio == remote_len, (
+                         "KV cache sizes must match between P and D when "
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py
+@@ -77,6 +77,10 @@
+     region_members: list[list[str]] = field(default_factory=list)
+     # Packed member -> (byte offset in its region's block, bytes per page).
+     packed_member_layouts: dict[str, tuple[int, int]] = field(default_factory=dict)
++    # Physical KV heads per rank held by each advertised region, in region order.
++    # 0 = not head-sharded (MLA, SSM, scratch), -1 = layers with different head
++    # counts share the region. None (older peers) = use the model-wide count.
++    region_kv_heads: list[int] | None = None
+ 
+ 
+ @dataclass
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/tp_mapping.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/tp_mapping.py
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/tp_mapping.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/tp_mapping.py
+@@ -159,3 +159,56 @@
+         rank_offset_factor=rank_offset_factor,
+         local_consumers=local_consumers,
+     )
++
++
++def compute_region_head_offset(
++    local_tp_rank: int,
++    local_tp_size: int,
++    remote_tp_size: int,
++    source_rank: int,
++    local_heads: int,
++    remote_heads: int,
++) -> int:
++    """Head offset this rank reads at inside one remote region's block (D_TP >= P_TP).
++
++    ``local_heads`` / ``remote_heads`` are the physical KV heads per rank that
++    *this region* holds on each side (``AttentionSpec.num_kv_heads``). They can
++    differ between regions of one model: Gemma 4 has 16 KV heads on its
++    sliding-window layers but 4 on its global layers, so at P_TP=4 -> D_TP=8 a
++    sliding region is split 2-way while a global region (1 head on both sides,
++    replicated on D) must be read whole.
++
++    Returns the offset, in heads, from the start of the remote block; the read
++    then covers ``local_heads`` heads. Raises ``ValueError`` when the heads this
++    rank needs are not contiguous inside ``source_rank``'s block.
++    """
++    if local_tp_size < remote_tp_size:
++        raise ValueError("compute_region_head_offset handles D_TP >= P_TP only")
++    if local_heads <= 0 or remote_heads <= 0:
++        raise ValueError(
++            f"KV head counts must be positive: local={local_heads}, "
++            f"remote={remote_heads}"
++        )
++    if local_heads == remote_heads:
++        # Same per-rank heads on both sides (equal TP, or the region is
++        # replicated on D): read the whole remote block.
++        return 0
++    if remote_heads % local_heads != 0:
++        raise ValueError(
++            f"Remote KV heads per rank ({remote_heads}) is not a multiple of "
++            f"local KV heads per rank ({local_heads})."
++        )
++    # remote_heads > local_heads >= 1, so P is not replicated for this region and
++    # the region's total head count is exact.
++    total_heads = remote_heads * remote_tp_size
++    local_first_head = local_tp_rank * total_heads // local_tp_size
++    remote_first_head = source_rank * remote_heads
++    offset = local_first_head - remote_first_head
++    if offset < 0 or offset + local_heads > remote_heads:
++        raise ValueError(
++            f"Local rank {local_tp_rank} needs KV heads "
++            f"[{local_first_head}, {local_first_head + local_heads}) but source "
++            f"rank {source_rank} holds [{remote_first_head}, "
++            f"{remote_first_head + remote_heads})."
++        )
++    return offset
