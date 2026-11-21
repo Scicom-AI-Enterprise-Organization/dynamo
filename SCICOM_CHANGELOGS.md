@@ -15,6 +15,7 @@ Newest first. "Live" means serving production or benchmark traffic on 2026-10-17
 |---|---|---|---|---|
 | `v1.6.0-nightly-20261016-gemma4-hetero-tp.1` (tag + GitHub prerelease) | `197b12e` | same as the branch below | release artifact | prebuilt `ai_dynamo_runtime` wheel + vLLM 0.31.0 patch; images in ECR: CUDA 12.9 (`:<tag>`) and CUDA 13 (`:<tag>-cu130`) |
 | [`1.6.0-scicom-gemma4-toolturn-reasoning`](#160-scicom-gemma4-toolturn-reasoning) | `197b12e` | upstream `main` `f95c85b` (the 1.6.0.dev20261016 nightly) | **live** since 2026-10-17; base for new work | tm-h20 Slurm fleet (1P2D TP8) and TM B300 Bangkok k8s (prefill TP4 -> decode TP8) |
+| [`feat/dynamo-model-swap`](#featdynamo-model-swap) | `62ee582` | `1.6.0-scicom-gemma4-toolturn-reasoning` | merged into the 1.6.0 branch (`744639e`, docs `4ee6082`); deployment-only, no image | TM B300 node-2 reload lab (2026-11-21, then parked) |
 | [`feat/prom-metrics-for-bucketing`](#featprom-metrics-for-bucketing) | `85aff69` | `1.5.0-scicom-gemma4-toolturn-reasoning` | carried into 1.6.0; image kept | TM B300 node-2 DAG stand-in only (rests at 0 replicas) |
 | [`1.5.0-scicom-gemma4-toolturn-reasoning`](#150-scicom-gemma4-toolturn-reasoning) | `3e45671` | upstream `v1.5.0` | superseded on B300 2026-10-17; image kept | TM B300 node-2 DAG stand-in only (rests at 0 replicas) |
 | [`v1.3.0-gemma4-toolturn-reasoning.1`](#v130-gemma4-toolturn-reasoning1) | `0288f8f` | `v1.3.0-gemma4-channel-leak.1` | superseded 2026-10-17, frozen; the fallback when `RELEASE` is empty | tm-h20 Slurm fleet until 2026-10-17 |
@@ -67,6 +68,7 @@ All three are in Dynamo's frontend (the preprocessor and response parsing), not 
 | `8eff15d`, `2b6a0c8`, `929e907` | `7ff366d`, `43ec6d3`, `3e45671` | `deploy/scicom/` docs. |
 | `a98672d`, `067bd86` | `c21fa44`, `85aff69` | ISL-bucket frontend metrics from `feat/prom-metrics-for-bucketing`, next to upstream's renamed `DYN_METRICS_*` histogram variables. |
 | `7a2e5fa` | new | Defect 1 in upstream's unified (v2) parser path, which only `DYN_PARSER_VERSION=2` uses for gemma4. |
+| `fcabb49`, `62ee582` (merges `f3af890`, `744639e`) | new | `deploy/helm/charts/model-swap` from `feat/dynamo-model-swap` (below). Deployment-only: the release tag and images stay at `197b12e`. |
 | `0780d75` | new | `deploy/scicom/patches/vllm-0.31.0-nixl-per-region-kv-heads.patch` + `apply-vllm-patches.sh`: lets a gemma-4 prefill and decode run with different TP (stock vLLM fails the KV handshake on the first global layer, `SPLIT region 5`). Needs `--disable-hybrid-kv-cache-manager` on both engines, which costs KV capacity. |
 
 **Verified on tm-h20** (built from `7a2e5fa`, prefill TP4 on 1021 -> decode TP8 on 1019): gemma4 tool-turn checks 3/3 with thinking on and off on both parser paths, `guided_json` and `x-time-deployment` pass, recall check 9/9 across nodes (stock vLLM: HTTP 500). Rust: `postprocessor_parsing_stream` 109/109, reasoning/thinking/isl unit tests all pass; vLLM connector tests 64/64. Details in the branch's `deploy/scicom/DEPLOYMENT_CHANGELOG.md`.
@@ -75,6 +77,29 @@ All three are in Dynamo's frontend (the preprocessor and response parsing), not 
 
 - **tm-h20 prod**, 1P2D TP8 as before (frontend job 788, prefill 794 on 1022, decodes 792 on 1021 and 793 on 1019), restarted 12:01-12:26 UTC on the release. Verified: gemma4 checks 4/4 (tool turn with thinking off and on, `guided_json`, `x-time-deployment`), recall check 9/9. vLLM 0.31's own tracer reads only `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` and defaults to gRPC, so the workers set it to `http/protobuf`; without it every trace export fails with `UNIMPLEMENTED`.
 - **TM B300 Bangkok**, graph `gemma4-31b-dpo-nvfp4fp8attn-p4d8` (`Scicom-intl/gemma-4-31B-it-dpo-2026-08-11-NVFP4-FP8-attn-mse-calib-taas-voice`): prefill TP4 on node-1 GPUs 0-3 -> decode TP8 on node-2, the first production use of the hetero-TP patch, on the `-cu130` image. Verified: `TransferTopology(tp_ratio=2, local_tp=8, remote_tp=4)` on all 8 decode ranks, 0 `SPLIT region` / handshake errors, gemma4 checks 4/4, recall check 9/9 on 12.5k-token prompts. With `--disable-hybrid-kv-cache-manager` the KV cache holds 2,177,856 tokens on the prefill and 4,058,944 on the decode (`--max-model-len 204800`, FP8 KV).
+
+### `feat/dynamo-model-swap`
+
+**Change the model of a one-replica Dynamo prefill + decode pair with no downtime, from one edit.** `deploy/helm/charts/model-swap` adds the `DynamoModelSwap` CRD (`dms`) and a small controller; the chart's `README.md` has the details. Branched off `1.6.0-scicom-gemma4-toolturn-reasoning` and merged back into it on 2026-11-21. Deployment-only: no change to the runtime, the frontend, the operator or the vLLM patch, so nothing needs a rebuild.
+
+- **Why a controller:** neither upstream Dynamo nor the Dynamo operator has this. The operator rolls any worker change as a new worker-hash generation per component, and a second full-size generation does not fit beside the first on the same GPUs.
+- **How it works:**
+  1. **Download gate (every swap):** a Job per node fetches and checks the new weights and compares everything but the weights with the serving model.
+  2. **Weights-only change:** the running engines reload them in place (pause, `update_weights_from_disk`, resume, check), and roll back on any failure.
+  3. **Any other change:** the new model starts at `--gpu-memory-utilization` 0.27 beside the old 0.70 on the same GPUs. The old model goes once the frontend routes to the new copy (prefill first), then the new model comes up at 0.70 and the 0.27 copy goes.
+
+  Each step is its own workers-only DynamoGraphDeployment, which a frontend-only graph finds through Dynamo's namespace-prefix discovery. Callers keep one `--served-model-name`.
+- **Tested on TM B300 node-2** (2026-11-21, Gemma-4-31B NVFP4, prefill TP4 + decode TP4, load through the serverlessgpu proxy `llm-swap-test`):
+
+  | Run | Failed requests | Time |
+  |---|---|---|
+  | Bridge swap v15 → v20a, slots deleted whole | 3 of 13,560 | |
+  | Bridge swap, prefill first | 0 of 15,381 | |
+  | Bridge swap with the gate | 0 of 15,841 | 25.5 min |
+  | In-place reload of v20a | 0 of 745 | 10.3 s without new tokens |
+  | In-place reload of v20a, run by this chart | 0 of 644 | 16.3 s without new tokens |
+
+- **Where it runs:** the lab ran from b300-bangkok (`argocd/apps/reload-lab`, branch `exp/zero-downtime-reload`), then from this chart (b300-bangkok `879501c`), and is now parked.
 
 ### `feat/prom-metrics-for-bucketing`
 
@@ -164,6 +189,7 @@ They are labelled `model` and `isl_bucket` (`0-512`, `513-1024`, … `16385+`), 
 |---|---|---|---|
 | **tm-h20** (Slurm, bare metal, Singapore) | release `v1.6.0-nightly-20261016-gemma4-hetero-tp.1` since 2026-10-17 (before: `v1.3.0-gemma4-toolturn-reasoning.1` @ `c8893ec`, editable install in `venv-vllm023`) | `ucc_slurm-ui-job` `jobs/tm-h20/dynamo-release-venv.sh`, once per release into `/mnt/data/dynamo/releases/<tag>/venv`: vLLM 0.31.0 cu129, `ai-dynamo` 1.6.0.dev20261016 dependencies, the release's `ai_dynamo_runtime` wheel, the tag's source `--no-deps`, then `apply-vllm-patches.sh` | Set `RELEASE=<tag>` in the four gemma job specs (an empty `RELEASE` falls back to `venv-vllm023`) and restart them together; the frontend sets `TIME_DEPLOYMENT` to the tag. Record changes in `ucc_slurm-ui-job` `jobs/tm-h20/README.md`. |
 | **TM B300 Bangkok** (k3s, Dynamo operator 1.5.0), frontend + workers | release `v1.6.0-nightly-20261016-gemma4-hetero-tp.1` since 2026-10-17, ECR image `:…-cu130` | `AIES-Infra/b300-bangkok` app `dynamo-scicom-image`, Job `build-dynamo-vllm-runtime-197b12e-cu130` (`dockerfile-160.yaml` with `BASE_IMAGE=vllm/vllm-openai:v0.31.0-x86_64-ubuntu2404`, `NIXL_CUDA=cu13`); BuildKit on node-1, Rust tests gate the build, then `ctr push` to ECR | GitOps: the image in `argocd/apps/gemma4-31b-dpo-nvfp4fp8attn-p4d8`, pulled with `regcred` from `ecr-refresh`. `runtimeVersionOverride: "1.5.0"` on every component. `DYN_METRICS_ISL_BUCKETS` set on the frontend. |
+| **TM B300 Bangkok**, `DynamoModelSwap` controller and CRD | chart `deploy/helm/charts/model-swap` 0.2.0 from `feat/dynamo-model-swap` / the 1.6.0 branch; the controller runs on stock `python:3.12-slim` | nothing to build: the code ships in a ConfigMap | An Argo CD Application source pointing at the chart (b300-bangkok `argocd/app-of-apps/reload-lab.yaml` until the lab was parked on 2026-11-21); the fork is registered with `depth: 1` (`scicom-dynamo-repo.yaml`). |
 | **TM B300 Bangkok**, node-2 DAG stand-in (`dag-standin-gemma4-1p1d-tp4`, 0 replicas at rest) | `1.5.0-scicom-gemma4-toolturn-reasoning` @ `3e45671` (workers), `feat/prom-metrics-for-bucketing` @ `85aff69` (frontend) | same app, over `vllm-runtime:1.5.0`, imported as `localhost/scicom/dynamo-vllm-runtime:<tag>` (no registry) | Scaled up only by a node-2 DAG run. |
 | **ECR (AIES)**, images of the 1.6.0 release | `865626945255.dkr.ecr.ap-southeast-5.amazonaws.com/scicom/dynamo-vllm-runtime`:<br>`:v1.6.0-nightly-20261016-gemma4-hetero-tp.1` (= `:1.6.0-scicom-gemma4-hetero-tp-197b12e`), CUDA 12.9, digest `sha256:36a9fb9d…`, 12.3 GB<br>`:v1.6.0-nightly-20261016-gemma4-hetero-tp.1-cu130` (= `:1.6.0-scicom-gemma4-hetero-tp-197b12e-cu130`), CUDA 13, digest `sha256:bbb5b5c6…`, 10.3 GB | `AIES-Infra/b300-bangkok` `dynamo-scicom-image` Jobs `build-dynamo-vllm-runtime-197b12e` (base `vllm/vllm-openai:v0.31.0-x86_64-cu129-ubuntu2404`, `nixl[cu12]`) and `…-197b12e-cu130` (base `…:v0.31.0-x86_64-ubuntu2404`, `nixl[cu13]`); no `vllm-runtime:1.6.0` exists yet. Then `ctr push` from node-1 | Repository created 2026-10-17 with the AWS CLI (not in Terraform yet). Push a new tag per release. **Use `-cu130` on B300**: the CUDA 12.9 vLLM wheel builds its FP4 kernels for `sm_100a` only, which never runs on B300's `sm_103`, so NVFP4 models need the CUDA 13 build. A cluster pulling with the `b300-ecr-pull` IAM user needs the repository in that user's inline policy (added 2026-10-17). |
 | **tm-h20 test nodes** 1021 (prefill TP4) -> 1019 (decode TP8), torn down 2026-10-17 | `1.6.0-scicom-gemma4-toolturn-reasoning` @ `7a2e5fa` | `build-bindings.sh` into the venv `/mnt/data/dynamo-hetero/venv` (vLLM 0.31.0 cu129) + `apply-vllm-patches.sh` | Started by hand, own etcd :2399 / NATS :4242 / frontend :8030. The nodes went back to prod decodes. |
