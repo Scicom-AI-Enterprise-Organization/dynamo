@@ -1,0 +1,71 @@
+# The controller reads its DynamoModelSwaps and writes their status, and creates, patches (a slot's prefill to 0
+# replicas) and deletes only the DynamoGraphDeployments it owns, all in the watched namespace.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "model-swap.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "model-swap.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "model-swap.fullname" . }}
+  namespace: {{ include "model-swap.watchNamespace" . }}
+  labels:
+    {{- include "model-swap.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [dynamoswap.scicom.dev]
+    resources: [dynamoswaps]
+    verbs: [get, list, watch]
+  - apiGroups: [dynamoswap.scicom.dev]
+    resources: [dynamoswaps/status]
+    verbs: [get, patch]
+  - apiGroups: [nvidia.com]
+    resources: [dynamographdeployments]
+    verbs: [get, list, create, patch, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "model-swap.fullname" . }}
+  namespace: {{ include "model-swap.watchNamespace" . }}
+  labels:
+    {{- include "model-swap.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "model-swap.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "model-swap.fullname" . }}
+    namespace: {{ .Release.Namespace }}
+---
+# Read-only, cluster-wide: its slots' and frontend pods, and, before it starts an engine, every pod pinned to the
+# same cards (nvidia.com/use-gpuuuid) in any namespace, to check HAMi room and that no engine there is still loading.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "model-swap.watchNamespace" . }}-{{ include "model-swap.fullname" . }}-pod-reader
+  labels:
+    {{- include "model-swap.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "model-swap.watchNamespace" . }}-{{ include "model-swap.fullname" . }}-pod-reader
+  labels:
+    {{- include "model-swap.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "model-swap.watchNamespace" . }}-{{ include "model-swap.fullname" . }}-pod-reader
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "model-swap.fullname" . }}
+    namespace: {{ .Release.Namespace }}

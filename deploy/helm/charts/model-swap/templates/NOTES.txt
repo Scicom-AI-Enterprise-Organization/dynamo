@@ -1,0 +1,9 @@
+The DynamoModelSwap controller runs in {{ .Release.Namespace }} and swaps the DynamoModelSwaps in {{ include "model-swap.watchNamespace" . }}.
+
+Next, in {{ include "model-swap.watchNamespace" . }}:
+  1. A frontend-only DynamoGraphDeployment (the graph named in spec.frontendGraph).
+  2. A DynamoModelSwap (see examples/dynamomodelswap-gemma.yaml in the chart source).
+
+Watch a swap:
+  kubectl -n {{ include "model-swap.watchNamespace" . }} get dms -w
+  kubectl -n {{ .Release.Namespace }} logs deploy/{{ include "model-swap.fullname" . }} -f

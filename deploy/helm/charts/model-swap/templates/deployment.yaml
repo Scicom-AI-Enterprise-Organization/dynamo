@@ -1,0 +1,88 @@
+# The DynamoModelSwap controller: one replica, a plain Python loop every 10 s over the DynamoModelSwaps in the
+# watched namespace. Recreate, so two controllers never act on the same swap.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "model-swap.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "model-swap.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "model-swap.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "model-swap.selectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/code: {{ include "model-swap.code" . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "model-swap.fullname" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.deps.install }}
+      initContainers:
+        - name: deps
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: [pip, install, --no-cache-dir, --target, /deps]
+          args:
+            {{- with .Values.deps.indexUrl }}
+            - --index-url
+            - {{ . | quote }}
+            {{- end }}
+            {{- range .Values.deps.packages }}
+            - {{ . | quote }}
+            {{- end }}
+          volumeMounts:
+            - name: deps
+              mountPath: /deps
+      {{- end }}
+      containers:
+        - name: controller
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: [python, -u, /app/main.py]
+          workingDir: /app
+          env:
+            - name: PYTHONPATH
+              value: /deps:/app
+            - name: WATCH_NAMESPACE
+              value: {{ include "model-swap.watchNamespace" . | quote }}
+          ports:
+            - name: health
+              containerPort: 8080
+          # 200 while the loop has listed DynamoModelSwaps in the last 180 s.
+          livenessProbe:
+            httpGet: {path: /, port: health}
+            periodSeconds: 30
+            failureThreshold: 4
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: code
+              mountPath: /app
+            - name: deps
+              mountPath: /deps
+      volumes:
+        - name: code
+          configMap:
+            name: {{ include "model-swap.fullname" . }}-code
+        - name: deps
+          emptyDir: {}

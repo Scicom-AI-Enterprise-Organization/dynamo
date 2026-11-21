@@ -11,6 +11,15 @@ so keep `TIME_DEPLOYMENT` in the sbatch in step with the `.so` you actually buil
 
 ---
 
+## Branch `feat/dynamo-model-swap` (off `1.6.0-scicom-gemma4-toolturn-reasoning`)
+
+Adds `deploy/helm/charts/model-swap`: the `DynamoModelSwap` CRD and its controller, which change the model of a
+one-replica prefill + decode graph with no downtime from one edit of `spec.model` (a 0.27 bridge copy of the new
+model beside the old 0.70, then the new 0.70). Deployment-only: no change to the runtime, the frontend or the operator,
+so the images and the `.so` stay as below. The same controller code ran the B300 node-2 reload lab on 2026-11-21 from
+b300-bangkok (`argocd/apps/reload-lab`, branch `exp/zero-downtime-reload`, commit `2839b82`): 0 of 15,381 requests
+failed during a swap under load. Not yet deployed from this chart. See the chart's `README.md`.
+
 ## Branch `1.6.0-scicom-gemma4-toolturn-reasoning`
 
 The same fixes on upstream `main` at `f95c85b41` (2026-10-16, the commit behind the

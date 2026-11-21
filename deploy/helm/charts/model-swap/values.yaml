@@ -1,0 +1,35 @@
+# model-swap: the DynamoModelSwap controller. One replica: the swap state lives in each DynamoModelSwap's status.
+
+# The namespace whose DynamoModelSwaps the controller runs, and where its slot DynamoGraphDeployments and the
+# frontend-only graph live. Empty: the release namespace.
+watchNamespace: ""
+
+# The controller is plain Python on a stock image; the code comes from a ConfigMap built from controller/.
+image:
+  repository: python
+  tag: "3.12-slim"
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# Install the Kubernetes client into an emptyDir at start (needs PyPI, or a mirror in indexUrl). Set install to
+# false when the image already has the packages.
+deps:
+  install: true
+  packages:
+    - kubernetes==31.0.0
+  indexUrl: ""
+
+nameOverride: ""
+# Keep the names of an existing install, e.g. dynamoswap-controller for the B300 reload lab.
+fullnameOverride: ""
+
+nodeSelector: {}
+tolerations: []
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    memory: 512Mi

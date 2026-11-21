@@ -1,0 +1,44 @@
+# Example frontend-only DynamoGraphDeployment for a DynamoModelSwap (spec.frontendGraph: lab). The operator gives
+# this frontend DYN_NAMESPACE_PREFIX=<k8s namespace>-lab, and every slot the controller creates (lab-<swap>-f<n>,
+# lab-<swap>-b<n>) registers its workers in <k8s namespace>-lab-<swap>-<f|b><n>-<hash>, which starts with that
+# prefix, so this one long-lived frontend serves every slot as one model. Keep it in the same namespace as the
+# DynamoModelSwap, and give no other graph there a name starting with "lab" (a literal prefix match): the frontend
+# would serve its workers too.
+# B300 values: node name, image, regcred. Expose it with its Service (<graph>-frontend:8000) or your own.
+apiVersion: nvidia.com/v1beta1
+kind: DynamoGraphDeployment
+metadata:
+  name: lab
+spec:
+  backendFramework: vllm
+  components:
+    - name: Frontend
+      type: frontend
+      runtimeVersionOverride: "1.5.0"
+      replicas: 1
+      podTemplate:
+        spec:
+          terminationGracePeriodSeconds: 100
+          imagePullSecrets:
+            - name: regcred
+          nodeSelector:
+            kubernetes.io/hostname: tm-ucc-6hpzfjhn-0001
+          containers:
+            - name: main
+              image: 865626945255.dkr.ecr.ap-southeast-5.amazonaws.com/scicom/dynamo-vllm-runtime:v1.6.0-nightly-20261016-gemma4-hetero-tp.1-cu130
+              imagePullPolicy: IfNotPresent
+              env:
+                - name: DYN_ROUTER_MODE
+                  value: round-robin
+                - name: DYN_MIGRATION_LIMIT
+                  value: "2"
+                - name: DYN_HTTP_GRACEFUL_SHUTDOWN_TIMEOUT_SECS
+                  value: "90"
+                - name: DYN_TCP_MAX_MESSAGE_SIZE
+                  value: "134217728"
+                - name: DYN_MM_MAX_DATA_URL_MB
+                  value: "64"
+                - name: DYN_HTTP_BODY_LIMIT_MB
+                  value: "64"
+                - name: TIME_DEPLOYMENT
+                  value: reload-lab
