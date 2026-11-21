@@ -1,0 +1,9 @@
+# Not part of the release: tests, examples and build helpers. .Files cannot read these, so the code ConfigMap
+# holds only controller/main.py and controller/logic.py.
+controller/test_*.py
+__pycache__/
+*.pyc
+.pytest_cache/
+examples/
+Makefile
+.git/

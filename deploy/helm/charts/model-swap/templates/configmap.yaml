@@ -1,0 +1,10 @@
+# The controller code (controller/main.py and controller/logic.py), mounted at /app in the controller pod.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "model-swap.fullname" . }}-code
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "model-swap.labels" . | nindent 4 }}
+data:
+  {{- include "model-swap.code" . | nindent 2 }}

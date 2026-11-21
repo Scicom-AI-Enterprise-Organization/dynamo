@@ -1,0 +1,78 @@
+# DynamoModelSwap: one Dynamo prefill + decode pair whose model changes with no downtime on one replica. Edit
+# spec.model (or anything in spec) and the model-swap controller runs the swap by itself: a bridge copy of the new
+# model at 0.27 beside the old at 0.70, the old removed once the frontend routes to the bridge, the new at 0.70 once
+# the old is gone, then the bridge removed. --served-model-name stays spec.servedModelName throughout.
+# Helm installs this file on the first install only and never upgrades or deletes it: apply schema changes with
+# kubectl apply -f. Same schema as the B300 reload lab (b300-bangkok argocd/apps/reload-lab/swap-crd.yaml).
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: dynamoswaps.dynamoswap.scicom.dev
+spec:
+  group: dynamoswap.scicom.dev
+  scope: Namespaced
+  names:
+    kind: DynamoModelSwap
+    plural: dynamoswaps
+    singular: dynamoswap
+    shortNames: [dms]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - {name: Phase, type: string, jsonPath: .status.phase}
+        - {name: Serving, type: string, jsonPath: .status.servingModel}
+        - {name: Message, type: string, jsonPath: .status.message}
+        - {name: Desired, type: string, jsonPath: .spec.model, priority: 1}
+        - {name: Age, type: date, jsonPath: .metadata.creationTimestamp}
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [model, servedModelName, graph]
+              properties:
+                model:
+                  type: string
+                  description: HF repo id (read from /data/hf, HF_HUB_OFFLINE). The one field to edit for a swap.
+                servedModelName:
+                  type: string
+                  description: The name callers send. Every slot registers it as its primary name, so it never changes.
+                versionAlias:
+                  type: boolean
+                  default: true
+                  description: Also register spec.model as an alias, so a caller can pin one version during a swap.
+                frontendGraph:
+                  type: string
+                  default: lab
+                  description: The frontend-only DGD that discovers the slots (they are named <frontendGraph>-<swap>-<f|b><n>).
+                steady:
+                  type: object
+                  properties:
+                    gpuMemoryUtilization: {type: number}
+                    gpumemPercentage: {type: integer}
+                bridge:
+                  type: object
+                  properties:
+                    gpuMemoryUtilization: {type: number}
+                    gpumemPercentage: {type: integer}
+                readyTimeoutSeconds:
+                  type: integer
+                  description: How long a slot may take to be routed to before it counts as failed (default 1800).
+                fullRetries:
+                  type: integer
+                  description: Retries of a failed full engine before the swap stops on the bridge (default 1).
+                graph:
+                  type: object
+                  description: >-
+                    A DynamoGraphDeployment spec with exactly one prefill and one decode component, cards pinned with
+                    nvidia.com/use-gpuuuid. The controller owns --model, --served-model-name, --gpu-memory-utilization,
+                    the host ports and nvidia.com/gpumem-percentage, and strips any it finds here.
+                  x-kubernetes-preserve-unknown-fields: true
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true

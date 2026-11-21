@@ -1,0 +1,296 @@
+# Example DynamoModelSwap: the one manifest to edit, as run in the B300 reload lab (node-2, namespace reload-lab,
+# Gemma-4-31B NVFP4, prefill TP4 on cards 0-3 + decode TP4 on cards 4-7). Change spec.model and the controller:
+#   1. bridge: the new model at util 0.27 (HAMi gpumem 27) beside the old at 0.70, on the same 8 cards
+#   2. once the frontend routes requests to the bridge, the old 0.70 pair is removed, prefill first (60 s drain)
+#   3. once the old pods are gone, the new model at 0.70
+#   4. once the frontend routes to it, the bridge is removed the same way
+# Callers always send spec.servedModelName; with versionAlias, spec.model is also an alias, so a request can pin a
+# version during a swap. Watch: kubectl get dms gemma -w. History: .status.history.
+# spec.graph is a DynamoGraphDeployment spec (one prefill + one decode); the controller sets --model,
+# --served-model-name, --gpu-memory-utilization, the host ports and nvidia.com/gpumem-percentage on each slot.
+# Cluster-specific, change for another cluster: the GPU UUIDs (nvidia.com/use-gpuuuid), the node name, the image
+# and regcred, the RDMA resource and UCX devices, and /data/hf, where the weights must already be
+# (HF_HUB_OFFLINE=1). The ArgoCD annotation only matters when ArgoCD syncs it in the same app as the CRD.
+apiVersion: dynamoswap.scicom.dev/v1alpha1
+kind: DynamoModelSwap
+metadata:
+  name: gemma
+  annotations:
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+spec:
+  model: Scicom-intl/gemma-4-31B-it-dpo-repetition-v3.3-handover-v15-2026-10-24-NVFP4-FP8-attn
+  servedModelName: gemma-4-31b-dpo
+  versionAlias: true
+  frontendGraph: lab
+  steady:
+    gpuMemoryUtilization: 0.70
+    gpumemPercentage: 70
+  bridge:
+    gpuMemoryUtilization: 0.27
+    gpumemPercentage: 27
+  readyTimeoutSeconds: 1800
+  graph:
+    backendFramework: vllm
+    components:
+      - name: VllmPrefillWorker
+        type: prefill
+        runtimeVersionOverride: "1.5.0"
+        replicas: 1
+        sharedMemorySize: 16Gi
+        podTemplate:
+          metadata:
+            labels:
+            annotations:
+              nvidia.com/deployment-rolling-update-max-surge: "0"
+              nvidia.com/deployment-rolling-update-max-unavailable: "1"
+              nvidia.com/use-gpuuuid: "GPU-6bda2604-8848-593c-2b40-06a4134e0f24,GPU-603b8a6a-44b9-c7a7-e157-495c9562a16d,GPU-486ac974-ca9b-97b4-6ebb-6380976fa7c6,GPU-4bc18936-6aaa-dc73-7a94-3f0df1fd2243"
+          spec:
+            terminationGracePeriodSeconds: 100
+            imagePullSecrets:
+              - name: regcred
+            runtimeClassName: nvidia
+            hostNetwork: true
+            dnsPolicy: ClusterFirstWithHostNet
+            nodeSelector:
+              kubernetes.io/hostname: tm-ucc-6hpzfjhn-0001
+            volumes:
+              - name: hf-cache
+                hostPath:
+                  path: /data/hf
+                  type: Directory
+            containers:
+              - name: main
+                image: 865626945255.dkr.ecr.ap-southeast-5.amazonaws.com/scicom/dynamo-vllm-runtime:v1.6.0-nightly-20261016-gemma4-hetero-tp.1-cu130
+                imagePullPolicy: IfNotPresent
+                command: [python3, -m, dynamo.vllm]
+                livenessProbe:
+                  httpGet:
+                    path: /live
+                    port: system
+                  periodSeconds: 10
+                  timeoutSeconds: 5
+                  failureThreshold: 12
+                args:
+                  - --kv-cache-dtype
+                  - fp8
+                  - --tensor-parallel-size
+                  - "4"
+                  - --max-model-len
+                  - "204800"
+                  - --block-size
+                  - "64"
+                  - --enable-multimodal
+                  - --dyn-tool-call-parser
+                  - gemma4
+                  - --dyn-reasoning-parser
+                  - gemma4
+                  - --no-enable-prefix-caching
+                  - --disable-hybrid-kv-cache-manager
+                  - --structured-outputs-config
+                  - '{"backend": "xgrammar", "disable_any_whitespace": true}'
+                  - --kv-transfer-config
+                  - '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'
+                  - --disaggregation-mode
+                  - prefill
+                  - --max-num-batched-tokens
+                  - "32768"
+                  - --kv-events-config
+                  - '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:20080","enable_kv_cache_events":true}'
+                ports:
+                  - name: system
+                    containerPort: 9090
+                    protocol: TCP
+                  - name: nixl
+                    containerPort: 19090
+                    protocol: TCP
+                env:
+                  - name: HF_HOME
+                    value: /data/hf
+                  - name: HF_HUB_OFFLINE
+                    value: "1"
+                  - name: DYN_SYSTEM_PORT
+                    value: "9090"
+                  - name: DYN_FORWARDPASS_METRIC_PORT
+                    value: "20380"
+                  - name: VLLM_NIXL_SIDE_CHANNEL_PORT
+                    value: "5600"
+                  - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: status.hostIP
+                  - name: CUDA_DISABLE_CONTROL
+                    value: "true"
+                  - name: DYN_RUNTIME_GRACEFUL_SHUTDOWN_TIMEOUT_SECS
+                    value: "90"
+                  # After SIGTERM the worker unregisters, then keeps serving its in-flight requests for this long before
+                  # it stops the engine (fork default 5 s: longer streams were cut, and the frontend's migration cannot
+                  # move a stream to another slot). Below terminationGracePeriodSeconds (100).
+                  - name: DYN_GRACEFUL_SHUTDOWN_GRACE_PERIOD_SECS
+                    value: "60"
+                  - name: DYN_TCP_MAX_MESSAGE_SIZE
+                    value: "134217728"
+                  - name: DYN_MM_MAX_DATA_URL_MB
+                    value: "64"
+                  - name: VLLM_USE_DEEP_GEMM
+                    value: "0"
+                  - name: VLLM_OMNI_USE_QUACK_FP8
+                    value: "0"
+                  - name: PYTHONHASHSEED
+                    value: "0"
+                  - name: NCCL_NET_PLUGIN
+                    value: none
+                  - name: UCX_TLS
+                    value: rc_x,cuda_copy,cuda_ipc
+                  - name: UCX_NET_DEVICES
+                    value: mlx5_bond_0:1,mlx5_bond_1:1,mlx5_bond_2:1,mlx5_bond_3:1,mlx5_bond_4:1,mlx5_bond_5:1,mlx5_bond_6:1,mlx5_bond_7:1
+                  - name: UCX_IB_ADDR_TYPE
+                    value: eth
+                  - name: UCX_IB_GID_INDEX
+                    value: "3"
+                  - name: UCX_RNDV_SCHEME
+                    value: get_zcopy
+                  - name: UCX_RNDV_THRESH
+                    value: "0"
+                securityContext:
+                  runAsUser: 0
+                  capabilities:
+                    add: [IPC_LOCK]
+                resources:
+                  limits:
+                    nvidia.com/gpu: "4"
+                    nvidia.com/gpumem-percentage: "70"
+                    rdma/rdma_shared_device_a: "1"
+                volumeMounts:
+                  - name: hf-cache
+                    mountPath: /data/hf
+                    readOnly: true
+      - name: VllmDecodeWorker
+        type: decode
+        runtimeVersionOverride: "1.5.0"
+        replicas: 1
+        sharedMemorySize: 16Gi
+        podTemplate:
+          metadata:
+            labels:
+            annotations:
+              nvidia.com/deployment-rolling-update-max-surge: "0"
+              nvidia.com/deployment-rolling-update-max-unavailable: "1"
+              nvidia.com/use-gpuuuid: "GPU-86830bcd-91f3-9f68-f06d-5be1ee19cf85,GPU-fad63ea4-844f-3550-9cfc-cfd75145a0b1,GPU-15881fba-22ad-17c9-1875-d2857293cc85,GPU-dda176d3-a46b-1cec-c00c-007a8d13a4ca"
+          spec:
+            terminationGracePeriodSeconds: 100
+            imagePullSecrets:
+              - name: regcred
+            runtimeClassName: nvidia
+            hostNetwork: true
+            dnsPolicy: ClusterFirstWithHostNet
+            nodeSelector:
+              kubernetes.io/hostname: tm-ucc-6hpzfjhn-0001
+            volumes:
+              - name: hf-cache
+                hostPath:
+                  path: /data/hf
+                  type: Directory
+            containers:
+              - name: main
+                image: 865626945255.dkr.ecr.ap-southeast-5.amazonaws.com/scicom/dynamo-vllm-runtime:v1.6.0-nightly-20261016-gemma4-hetero-tp.1-cu130
+                imagePullPolicy: IfNotPresent
+                command: [python3, -m, dynamo.vllm]
+                livenessProbe:
+                  httpGet:
+                    path: /live
+                    port: system
+                  periodSeconds: 10
+                  timeoutSeconds: 5
+                  failureThreshold: 12
+                args:
+                  - --kv-cache-dtype
+                  - fp8
+                  - --tensor-parallel-size
+                  - "4"
+                  - --max-model-len
+                  - "204800"
+                  - --block-size
+                  - "64"
+                  - --enable-multimodal
+                  - --dyn-tool-call-parser
+                  - gemma4
+                  - --dyn-reasoning-parser
+                  - gemma4
+                  - --no-enable-prefix-caching
+                  - --disable-hybrid-kv-cache-manager
+                  - --structured-outputs-config
+                  - '{"backend": "xgrammar", "disable_any_whitespace": true}'
+                  - --kv-transfer-config
+                  - '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'
+                  - --disaggregation-mode
+                  - decode
+                  - --max-num-batched-tokens
+                  - "4096"
+                ports:
+                  - name: system
+                    containerPort: 9091
+                    protocol: TCP
+                  - name: nixl
+                    containerPort: 19091
+                    protocol: TCP
+                env:
+                  - name: HF_HOME
+                    value: /data/hf
+                  - name: HF_HUB_OFFLINE
+                    value: "1"
+                  - name: DYN_SYSTEM_PORT
+                    value: "9091"
+                  - name: DYN_FORWARDPASS_METRIC_PORT
+                    value: "20390"
+                  - name: VLLM_NIXL_SIDE_CHANNEL_PORT
+                    value: "5700"
+                  - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: status.hostIP
+                  - name: CUDA_DISABLE_CONTROL
+                    value: "true"
+                  - name: DYN_RUNTIME_GRACEFUL_SHUTDOWN_TIMEOUT_SECS
+                    value: "90"
+                  # After SIGTERM the worker unregisters, then keeps serving its in-flight requests for this long before
+                  # it stops the engine (fork default 5 s: longer streams were cut, and the frontend's migration cannot
+                  # move a stream to another slot). Below terminationGracePeriodSeconds (100).
+                  - name: DYN_GRACEFUL_SHUTDOWN_GRACE_PERIOD_SECS
+                    value: "60"
+                  - name: DYN_TCP_MAX_MESSAGE_SIZE
+                    value: "134217728"
+                  - name: DYN_MM_MAX_DATA_URL_MB
+                    value: "64"
+                  - name: VLLM_USE_DEEP_GEMM
+                    value: "0"
+                  - name: VLLM_OMNI_USE_QUACK_FP8
+                    value: "0"
+                  - name: PYTHONHASHSEED
+                    value: "0"
+                  - name: NCCL_NET_PLUGIN
+                    value: none
+                  - name: UCX_TLS
+                    value: rc_x,cuda_copy,cuda_ipc
+                  - name: UCX_NET_DEVICES
+                    value: mlx5_bond_0:1,mlx5_bond_1:1,mlx5_bond_2:1,mlx5_bond_3:1,mlx5_bond_4:1,mlx5_bond_5:1,mlx5_bond_6:1,mlx5_bond_7:1
+                  - name: UCX_IB_ADDR_TYPE
+                    value: eth
+                  - name: UCX_IB_GID_INDEX
+                    value: "3"
+                  - name: UCX_RNDV_SCHEME
+                    value: get_zcopy
+                  - name: UCX_RNDV_THRESH
+                    value: "0"
+                securityContext:
+                  runAsUser: 0
+                  capabilities:
+                    add: [IPC_LOCK]
+                resources:
+                  limits:
+                    nvidia.com/gpu: "4"
+                    nvidia.com/gpumem-percentage: "70"
+                    rdma/rdma_shared_device_a: "1"
+                volumeMounts:
+                  - name: hf-cache
+                    mountPath: /data/hf
+                    readOnly: true
