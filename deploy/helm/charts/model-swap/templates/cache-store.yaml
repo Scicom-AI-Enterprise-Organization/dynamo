@@ -1,0 +1,19 @@
+{{- if and .Values.cacheStore.enabled (not .Values.cacheStore.existingClaim) }}
+# The compile-cache store (cacheStore in values.yaml): one directory per namespace, written only by the controller's
+# cache-publish Jobs and read by its cache-seed Jobs, in the namespace those Jobs run in. Losing it costs one cold start.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "model-swap.cacheStoreClaim" . }}
+  namespace: {{ include "model-swap.watchNamespace" . }}
+  labels:
+    {{- include "model-swap.labels" . | nindent 4 }}
+spec:
+  accessModes: [ReadWriteMany]
+  {{- with .Values.cacheStore.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.cacheStore.size }}
+{{- end }}

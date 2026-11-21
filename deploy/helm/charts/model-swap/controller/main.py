@@ -39,6 +39,10 @@ G_LABEL = "nvidia.com/dynamo-graph-deployment-name"
 L_JOB, L_NODE = f"{logic.GROUP}/job", f"{logic.GROUP}/node"
 PAUSE_CAP = float(os.environ.get("PAUSE_CAP_SECONDS", "60"))
 FETCH_SRC = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "fetch.py")).read()
+# The namespace's compile-cache store (a ReadWriteMany claim the chart makes; empty: no seeding), mounted by the
+# cache-seed and cache-publish Jobs at /store, one directory per namespace.
+STORE_PVC = os.environ.get("CACHE_STORE_PVC", "")
+logic.CACHE_TIMEOUT = float(os.environ.get("CACHE_TIMEOUT_SECONDS") or logic.CACHE_TIMEOUT)
 last_ok = time.time()
 
 
@@ -89,9 +93,22 @@ def job_body(cr: dict, s: dict, key: str, mode: str, params: dict, node: str, i:
            {"name": "NVIDIA_VISIBLE_DEVICES", "value": "void"},
            {"name": "HF_TOKEN", "valueFrom": {"secretKeyRef": {"name": f["tokenSecret"], "key": "token",
                                                                "optional": True}}}]
+    volumes = [{"name": "hf", "hostPath": {"path": logic.HF_ROOT, "type": "Directory"}}]
+    mounts = [{"name": "hf", "mountPath": logic.HF_ROOT}]
+    deadline = int(f["timeoutSeconds"])
     if mode == "fetch":
         env += [{"name": "MODEL", "value": params["model"]}, {"name": "REVISION", "value": params["revision"]},
                 {"name": "COMPARE", "value": params["compare"]}]
+    elif mode in ("cache-seed", "cache-publish"):
+        # The node's compile cache and the namespace's store; the copy stops 30 s before the controller stops waiting.
+        env = [{"name": "MODE", "value": mode}, {"name": "NVIDIA_VISIBLE_DEVICES", "value": "void"},
+               {"name": "CACHE_DIR", "value": "/cache"}, {"name": "STORE_DIR", "value": f"/store/{NS}"},
+               {"name": "CACHE_SECONDS", "value": str(max(30, int(logic.CACHE_TIMEOUT) - 30))}]
+        volumes = [{"name": "cache", "hostPath": {"path": logic.cache_dir(s, node), "type": "DirectoryOrCreate"}},
+                   {"name": "store", "persistentVolumeClaim": {"claimName": STORE_PVC}}]
+        mounts = [{"name": "cache", "mountPath": "/cache", "readOnly": mode == "cache-publish"},
+                  {"name": "store", "mountPath": "/store"}]
+        deadline = int(logic.CACHE_TIMEOUT) + 60
     else:
         env += [{"name": "LINK", "value": logic.link_path(NS, name, params["kind"])},
                 {"name": "TARGET", "value": params["target"]}]
@@ -102,19 +119,19 @@ def job_body(cr: dict, s: dict, key: str, mode: str, params: dict, node: str, i:
                      "ownerReferences": [{"apiVersion": cr["apiVersion"], "kind": cr["kind"], "name": name,
                                           "uid": cr["metadata"]["uid"], "controller": True}]},
         "spec": {
-            "backoffLimit": 0, "ttlSecondsAfterFinished": 1800, "activeDeadlineSeconds": int(f["timeoutSeconds"]),
+            "backoffLimit": 0, "ttlSecondsAfterFinished": 1800, "activeDeadlineSeconds": deadline,
             "template": {"metadata": {"labels": labels}, "spec": {
                 "restartPolicy": "Never",
                 "nodeSelector": {"kubernetes.io/hostname": node},
                 "tolerations": [{"operator": "Exists"}],
                 "imagePullSecrets": pod_spec.get("imagePullSecrets") or [],
-                "volumes": [{"name": "hf", "hostPath": {"path": logic.HF_ROOT, "type": "Directory"}}],
+                "volumes": volumes,
                 "containers": [{
                     "name": mode, "image": f.get("image") or _main_container(comp)["image"],
                     "imagePullPolicy": "IfNotPresent", "command": ["python3", "-c", FETCH_SRC], "env": env,
                     "securityContext": {"runAsUser": 0},
                     "resources": {"requests": {"cpu": "1", "memory": "1Gi"}, "limits": {"memory": "8Gi"}},
-                    "volumeMounts": [{"name": "hf", "mountPath": logic.HF_ROOT}]}]}}}}
+                    "volumeMounts": mounts}]}}}}
 
 
 def ensure_job(cr: dict, s: dict, key: str, mode: str, params: dict) -> None:
@@ -151,8 +168,10 @@ def job_views(name: str) -> dict:
     views = {}
     for key, items in by_key.items():
         bad = [f"{n}: {r.get('error') or 'job failed'}" for n, st, r in items if st == "failed"]
+        results = {n: {k: v for k, v in r.items() if k in ("copied", "bytes", "present", "busy", "failed", "errors", "note",
+                                                          "timedOut", "error")} for n, _, r in items if r}
         if bad:
-            views[key] = {"state": "failed", "error": "; ".join(bad)[:500]}
+            views[key] = {"state": "failed", "error": "; ".join(bad)[:500], "results": results}
         elif all(st == "succeeded" for _, st, _ in items):
             rs = [r for _, _, r in items]
             snaps = {r.get("snapshot") for r in rs if "snapshot" in r}
@@ -160,7 +179,7 @@ def job_views(name: str) -> dict:
                 views[key] = {"state": "failed", "error": f"nodes hold different revisions: {sorted(snaps)}"}
                 continue
             notc = [r for r in rs if "compatible" in r and not r["compatible"]]
-            views[key] = {"state": "succeeded", "result": {
+            views[key] = {"state": "succeeded", "results": results, "result": {
                 "snapshot": snaps.pop() if snaps else None,
                 "compatible": bool(rs) and all(r.get("compatible") for r in rs),
                 "why": (notc[0] if notc else rs[0]).get("why", "")}}
@@ -352,7 +371,7 @@ def reconcile(cr: dict) -> None:
             cache.extend(_api(p) for p in core.list_pod_for_all_namespaces().items)
         return logic.gpu_preflight(cache, logic.graph_gpus(s), int(pct))
 
-    acts, new = logic.decide(name, spec, status, slots, preflight, time.time(), job_views(name))
+    acts, new = logic.decide(name, spec, status, slots, preflight, time.time(), job_views(name), bool(STORE_PVC))
 
     for act in acts:
         if act[0] == "job":

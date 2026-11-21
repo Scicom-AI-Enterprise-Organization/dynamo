@@ -54,6 +54,11 @@ spec:
                   enum: [Auto, Bridge]
                   default: Auto
                   description: Auto reloads the running pair in place when only the weights change (needs versionAlias false); Bridge always swaps through a 0.27 bridge.
+                cache:
+                  type: string
+                  enum: [Seed, Cold]
+                  default: Seed
+                  description: Seed copies the namespace's warm compile caches (vLLM, FlashInfer, Triton) from the chart's cache store into each node's cache before a slot's engines start, and publishes a serving slot's new entries back. Best effort, never a gate. Cold skips both; engines compile what their node cache lacks. Changing it starts no swap.
                 fetch:
                   type: object
                   properties:

@@ -36,6 +36,20 @@ healthPort: 18080
 # reload is abandoned (the engine resumes on its old weights) and the swap goes through the bridge.
 pauseCapSeconds: 60
 
+# Compile-cache seeding for spec.cache: Seed. A ReadWriteMany volume keeps each namespace's warm vLLM, FlashInfer
+# and Triton compile caches (one directory per namespace). Before a slot's engines start, a Job per node copies into
+# the node's cache (the hostPath of the graph's compile-cache volume) every entry it lacks, so an engine that comes back
+# to a node (e.g. after training borrowed it) skips torch.compile and autotuning. A slot that serves steadily publishes
+# its nodes' new entries back. Best effort: off, a failure or a timeout means the engines compile what they lack.
+cacheStore:
+  enabled: false
+  # Use this claim; empty: the chart makes <fullname>-cache-store with the settings below.
+  existingClaim: ""
+  storageClass: ""
+  size: 100Gi
+  # Longest a slot's engines wait for seeding before they start with whatever their node cache holds.
+  timeoutSeconds: 300
+
 resources:
   requests:
     cpu: 50m

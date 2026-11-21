@@ -71,6 +71,12 @@ spec:
               value: {{ .Values.healthPort | quote }}
             - name: PAUSE_CAP_SECONDS
               value: {{ .Values.pauseCapSeconds | quote }}
+            {{- if .Values.cacheStore.enabled }}
+            - name: CACHE_STORE_PVC
+              value: {{ include "model-swap.cacheStoreClaim" . | quote }}
+            - name: CACHE_TIMEOUT_SECONDS
+              value: {{ .Values.cacheStore.timeoutSeconds | quote }}
+            {{- end }}
           ports:
             - name: health
               containerPort: {{ .Values.healthPort }}

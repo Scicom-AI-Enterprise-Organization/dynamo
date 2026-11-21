@@ -97,6 +97,31 @@ kubectl get dms gemma -o jsonpath='{.status.history}'    # each step with its ti
 kubectl logs deploy/model-swap -f                        # the release's full name
 ```
 
+## Compile-cache seeding (`spec.cache`)
+
+An engine that starts on a node whose compile cache is warm skips most of its load: on B300 a TP8 decode came up in
+about 4 minutes instead of 9-12, with torch.compile loaded straight from the AOT cache and FlashInfer's autotune results
+reused. A node that was lent out (training at the weekend) may come back with a missing or wiped cache, so with
+`cacheStore.enabled` the controller keeps a copy:
+
+- **Seed.** Beside the download gate, a Job on each node of the graph copies into the node's compile cache (the hostPath
+  of the graph's `compile-cache` volume) every entry of the store that the node lacks. A slot's engines start once the
+  Jobs finish, fail, or pass `cacheStore.timeoutSeconds` (default 300), whichever comes first.
+- **Publish.** Once a slot serves steadily (or its bridge is routed to), a Job on each node copies the node's new entries
+  to the store. It leaves entries written in the last 2 minutes, which an engine may still be writing.
+- **Entries.** Under `vllm/torch_compile_cache` (and its `torch_aot_compile`), `vllm/flashinfer_autotune_cache/*/*`,
+  `triton/cache` and `flashinfer/*/*/cached_ops`, each child directory is one entry, copied whole into a staging name and
+  renamed into place, or not at all. Other files are copied one by one. Nothing is overwritten or deleted, on either
+  side: every name keys its content.
+- **Never copied:** vLLM's startup plan (`vllm/startup_plan`, `VLLM_ENABLE_STARTUP_PLAN`). Its key ignores
+  `--gpu-memory-utilization`, so a bridge's plan would size the next full slot's KV cache at the bridge's budget.
+- **Best effort.** No store, `spec.cache: Cold`, a failed or slow copy, or a store that holds nothing for these engines:
+  each means the engines compile what their node cache lacks, as without seeding. `status.seed` records the outcome and
+  each node's counts. `spec.cache` is not part of what a slot is, so changing it starts no swap and restarts nothing.
+- **Store.** A ReadWriteMany claim (`cacheStore.existingClaim`, or one the chart makes with `storageClass` and `size`) in
+  the watched namespace, with one directory per namespace. Gemma-4-31B's caches for a TP4 + TP4 pair and a TP8 decode
+  come to about 20 GB.
+
 ## Requirements
 
 - The Dynamo operator, any release with `nvidia.com/v1beta1` DynamoGraphDeployments, and its platform (discovery).
@@ -131,6 +156,7 @@ The examples are the B300 reload lab's (node-2, Gemma-4-31B NVFP4, prefill TP4 o
 | `nodeSelector`, `tolerations`, `resources`, `imagePullSecrets` | | the controller pod |
 | `hostNetwork`, `healthPort` | `true`, `18080` | host network for the `/engine/` calls; the liveness port is then a host port |
 | `pauseCapSeconds` | `60` | longest a pause may wait for running requests before an in-place reload gives up and bridges |
+| `cacheStore.enabled`, `existingClaim`, `storageClass`, `size`, `timeoutSeconds` | `false`, `""`, `""`, `100Gi`, `300` | the compile-cache store for `spec.cache: Seed` (see Compile-cache seeding) |
 
 The CRD is in `crds/`. The Helm CLI installs it on the first install only and never upgrades or deletes it, so apply
 a changed CRD yourself; ArgoCD applies it on every sync. The controller code (`controller/main.py`,
@@ -152,6 +178,16 @@ Two models served together for only seconds. Requests slowed to 1.4-3.1 s (from 
 last 5-6 minutes of loading (CUDA graphs, autotune) on the same cards; the 0.27 bridge served the load at normal speed.
 Sizing on 288 GB B300s, Gemma-4-31B NVFP4 TP4: an engine at util `u` holds about `u × 267.69 GiB + 3 GiB`, and KV
 capacity is about 2.55M tokens per 1.0 of util (0.27: 0.58M, 0.70: 1.68M). 0.70 + 0.30 does not fit; 0.70 + 0.27 does.
+
+Compile-cache seeding, prod's TP8 decode (Gemma-4-31B NVFP4, 0.70) on node-2, the Jobs as the controller renders them:
+
+| Step | Result |
+|---|---|
+| Publish node-2's cache to the store (NFS, `nfs-models`) | 61 entries, 11.3 GB, 95 s from Job creation |
+| Seed an empty node cache from the store | 61 entries, 11.3 GB, 82 s; identical to the source but for two empty directories |
+| Decode engine on the seeded cache | container start to registered 4 min 19 s: AOT compile loaded directly on all 8 ranks (torch.compile 1.3 s), 80 FlashInfer autotune configs from the cache, KV 3.12M tokens. Cold: 9-12 min |
+| Store without this namespace's directory | the Job succeeds with "nothing to copy" |
+| Store claim missing | the pod stays Pending; the controller starts the engines after `timeoutSeconds`, the Job fails at its deadline |
 
 ## Limits
 
@@ -200,5 +236,5 @@ spec:
 ```bash
 cd deploy/helm/charts/model-swap/controller
 # The swap order against a simulated cluster. -c /dev/null skips the repo's pytest config (it needs pytest-benchmark).
-uv run --with pytest pytest -q -c /dev/null --rootdir . test_logic.py
+uv run --with pytest pytest -q -c /dev/null --rootdir . test_logic.py test_fetch.py
 ```

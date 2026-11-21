@@ -8,12 +8,19 @@ own runtime image, /data/hf mounted). Prints one JSON line to /dev/termination-l
               -> {snapshot, compatible, why, shards, bytes}
   MODE=link   Point the slot link $LINK at $TARGET (a snapshot dir), atomically. Slots run --model $LINK, so a
               restarted worker loads whatever version its slot serves now. -> {link, target}
+  MODE=cache-seed     Copy into this node's compile cache $CACHE_DIR every entry of the namespace's cache store
+                      $STORE_DIR that the node lacks, so an engine starts warm. Best effort: whatever is missing
+                      afterwards the engine compiles itself. -> {copied, bytes, present, ...}
+  MODE=cache-publish  The other way: entries of this node's cache that the store lacks, once its slot serves.
 """
+import fnmatch
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
+import time
 
 WEIGHTS = (".safetensors", ".bin", ".pt", ".pth", ".gguf")
 SKIP = ("README.md", ".gitattributes", "LICENSE", "LICENSE.md", "NOTICE", "USE_POLICY.md")
@@ -125,8 +132,160 @@ def link(path: str, target: str) -> None:
     os.replace(tmp, path)
 
 
+# ---------------------------------------------------------------- compile-cache seeding
+
+# The compile cache the slots mount (vllm/, flashinfer/, triton/). Under these directories every child directory is one
+# entry, copied whole or not at all: a torch.compile or AOT artifact, a FlashInfer autotune result, a Triton kernel, a
+# FlashInfer JIT op. Everything else is copied file by file. Each name keys its content (a hash of the config, the
+# shapes and the environment), so an entry present on both sides is the same and is never overwritten.
+ENTRY_PARENTS = ("vllm/torch_compile_cache", "vllm/torch_compile_cache/torch_aot_compile",
+                 "vllm/flashinfer_autotune_cache/*/*", "triton/cache", "flashinfer/*/*/cached_ops")
+# Never copied. vLLM's startup plan (VLLM_ENABLE_STARTUP_PLAN) is keyed by a hash that ignores
+# --gpu-memory-utilization and the ports, so a low bridge's KV budget (0.23) would be applied to the next 0.70 slot.
+# Compile and autotune entries do not depend on the memory budget, so the bridge and the full slot may share them.
+SKIP_DIRS = ("vllm/startup_plan",)
+STAGE = ".dms-stage-"
+SETTLE = 120          # publish: leave entries written in the last 2 minutes (an engine may still be writing them)
+
+
+def _match(rel: str, pattern: str) -> bool:
+    a, b = rel.split("/"), pattern.split("/")
+    return len(a) == len(b) and all(fnmatch.fnmatchcase(x, y) for x, y in zip(a, b))
+
+
+def _entry_parent(rel: str) -> bool:
+    return any(_match(rel, p) for p in ENTRY_PARENTS)
+
+
+def _skipped(rel: str, name: str) -> bool:
+    return (name.startswith(STAGE) or ".tmp" in name or name.endswith((".lock", ".part"))
+            or any(rel == d or rel.startswith(d + "/") for d in SKIP_DIRS))
+
+
+def cache_entries(root: str) -> list[tuple[str, bool]]:
+    """(path relative to root, is a whole-directory entry) of everything a sync copies."""
+    out = []
+
+    def walk(rel):
+        for name in sorted(os.listdir(os.path.join(root, rel) if rel else root)):
+            r = f"{rel}/{name}" if rel else name
+            p = os.path.join(root, r)
+            if _skipped(r, name) or os.path.islink(p):
+                continue
+            if os.path.isdir(p):
+                if _entry_parent(rel) and not _entry_parent(r):
+                    out.append((r, True))
+                else:
+                    walk(r)
+            elif os.path.isfile(p):
+                out.append((r, False))
+
+    if os.path.isdir(root):
+        walk("")
+    return out
+
+
+def _newest(path: str) -> float:
+    t = os.path.getmtime(path)
+    for r, ds, fs in os.walk(path):
+        for x in ds + fs:
+            try:
+                t = max(t, os.lstat(os.path.join(r, x)).st_mtime)
+            except OSError:
+                pass
+    return t
+
+
+def _size(path: str) -> int:
+    if os.path.isfile(path):
+        return os.path.getsize(path)
+    return sum(os.path.getsize(os.path.join(r, f)) for r, _, fs in os.walk(path) for f in fs)
+
+
+def _clear_stale_stages(root: str, age: float = 3600) -> None:
+    """Staging copies left by a killed sync (they are never renamed into place)."""
+    for r, ds, fs in os.walk(root):
+        for x in ds + fs:
+            if x.startswith(STAGE):
+                p = os.path.join(r, x)
+                try:
+                    if time.time() - os.lstat(p).st_mtime > age:
+                        shutil.rmtree(p) if os.path.isdir(p) and not os.path.islink(p) else os.unlink(p)
+                except OSError:
+                    pass
+        ds[:] = [d for d in ds if not d.startswith(STAGE)]
+
+
+def copy_entry(src: str, dst: str) -> bool:
+    """Copy one entry into place atomically and without overwriting: into a staging name beside dst first, then a rename
+    (a directory) or a hard link (a file), which fail if dst appeared meanwhile. False when dst was already there."""
+    if os.path.lexists(dst):
+        return False
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    stage = os.path.join(os.path.dirname(dst), f"{STAGE}{os.getpid()}-{os.path.basename(dst)}")
+    try:
+        if os.path.isdir(src):
+            shutil.copytree(src, stage, symlinks=True, copy_function=shutil.copy2)
+            try:
+                os.rename(stage, dst)      # fails on a non-empty dst: someone else put the entry there first
+            except OSError:
+                return False
+        else:
+            shutil.copy2(src, stage)
+            try:
+                os.link(stage, dst)
+            except FileExistsError:
+                return False
+        return True
+    finally:
+        if os.path.lexists(stage):
+            shutil.rmtree(stage, ignore_errors=True) if os.path.isdir(stage) and not os.path.islink(stage) \
+                else os.unlink(stage)
+
+
+def sync(src: str, dst: str, deadline: float, settle: float = 0) -> dict:
+    """Copy every entry of src that dst lacks. Never overwrites, never deletes, stops at the deadline. A failed entry is
+    counted and skipped: the engine compiles whatever is missing."""
+    res = {"copied": 0, "bytes": 0, "present": 0, "busy": 0, "failed": 0, "errors": []}
+    if not os.path.isdir(src):
+        return {**res, "note": f"{src} does not exist yet: nothing to copy"}
+    os.makedirs(dst, exist_ok=True)
+    _clear_stale_stages(dst)
+    for rel, _ in cache_entries(src):
+        if time.time() > deadline:
+            res["timedOut"] = True
+            break
+        s, d = os.path.join(src, rel), os.path.join(dst, rel)
+        if os.path.lexists(d):
+            res["present"] += 1
+            continue
+        try:
+            if settle and time.time() - _newest(s) < settle:
+                res["busy"] += 1
+                continue
+            if copy_entry(s, d):
+                res["copied"] += 1
+                res["bytes"] += _size(d)
+            else:
+                res["present"] += 1
+        except OSError as e:
+            res["failed"] += 1
+            if len(res["errors"]) < 3:
+                res["errors"].append(f"{rel}: {type(e).__name__}: {e}"[:200])
+    return res
+
+
 if __name__ == "__main__":
     mode = os.environ.get("MODE", "fetch")
+    if mode in ("cache-seed", "cache-publish"):
+        cache, store = os.environ["CACHE_DIR"], os.environ["STORE_DIR"]
+        deadline = time.time() + float(os.environ.get("CACHE_SECONDS", "240"))
+        os.nice(10)
+        try:
+            r = sync(store, cache, deadline) if mode == "cache-seed" else sync(cache, store, deadline, SETTLE)
+        except Exception as e:  # noqa: BLE001 - best effort: report it, the swap goes on
+            out({"mode": mode, "error": f"{type(e).__name__}: {e}"[:400]}, 1)
+        out({"mode": mode, **r})
     if mode == "link":
         target = os.environ["TARGET"]
         if not os.path.isfile(os.path.join(target, "config.json")):
