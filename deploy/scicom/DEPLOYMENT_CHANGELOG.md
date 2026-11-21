@@ -34,6 +34,7 @@ Each commit is a `cherry-pick -x` of its 1.5.0 commit, including the two of
 | (new) | `fa968622af` | Test-only: restores a closing brace lost while keeping both sets of tests at the end of `postprocessor_parsing_stream.rs`. |
 | (new) | `fcabb499e4`, merged by `f3af890c8b` (2026-11-21) | `deploy/helm/charts/model-swap`, from `feat/dynamo-model-swap`; see below. Deployment-only. |
 | (new) | `62ee582315`, merged 2026-11-21 | model-swap 0.2.0: download gate and in-place reload; see below. Deployment-only. |
+| (new) | `932fe4b1d4`, merged by `a7d07a7256` (2026-11-21) | model-swap 0.3.0: compile-cache seeding; see below. Deployment-only. |
 
 ### Model swap with no downtime: `deploy/helm/charts/model-swap` (2026-11-21)
 
@@ -54,6 +55,15 @@ back to the bridge. New fields: `revision`, `reload`, `fetch`, `servedModelAlias
 network. Ran on B300 node-2 on 2026-11-21, from the lab copy and then from this chart (b300-bangkok `879501c`): a gated
 bridge swap with 0 of 15,841 requests failed, and two in-place reloads of v20a with 0 of 745 and 0 of 644 failed and
 10.3 s and 16.3 s without new tokens. Still deployment-only: the release tag and its images stay at `197b12e`.
+
+**0.3.0** (`932fe4b1d4`): compile-cache seeding, so that an engine coming back to a node lent out for training starts
+warm. With `cacheStore.enabled`, a Job per node copies the namespace's vLLM, FlashInfer and Triton compile caches from a
+ReadWriteMany store into the node's compile cache beside the download gate, and a slot that serves steadily publishes
+its new entries back. The seeding is best effort and never blocks a swap. With no store, `spec.cache: Cold`, a failed
+copy, or no result within `cacheStore.timeoutSeconds` (default 300), the engines do a normal cold load. vLLM's startup
+plan is never copied, because its key ignores `--gpu-memory-utilization`. `spec.cache` is not part of the swap hash.
+On B300 node-2 (b300-bangkok `exp/zero-downtime-reload`, `d3f84d0`), prod's TP8 decode on a seeded cache went from
+container start to registered in 4 min 19 s; a cold start takes 9-12 min. Still deployment-only.
 
 ### Prefill and decode with different TP (gemma-4)
 
