@@ -1,8 +1,17 @@
 """DynamoModelSwap: the pure half (no Kubernetes, no HTTP), so the swap order can be tested on its own.
 
 One DynamoModelSwap holds a Dynamo graph's worker spec (a prefill and a decode component, as written in a
-DynamoGraphDeployment) plus the model. Edit spec.model and the controller swaps with no downtime, one replica:
+DynamoGraphDeployment) plus the model. Edit spec.model and the controller swaps with no downtime, one replica.
 
+Every change starts with the download gate (Fetching): a Job on each node of the graph fetches the new model into
+/data/hf if it is missing, checks every shard, and compares it with the serving model. Then one of two paths:
+
+  In place (Reloading), when only spec.model changed, the gate found the two versions identical but for their weights
+  (config, tokenizer, chat template, tensor names), spec.reload is Auto and spec.versionAlias is false: the controller
+  pauses the running pair (wait mode, at most 60 s), loads the new weights into it, resumes, and checks the version and
+  a probe request. Any failure loads the old weights back and falls back to the bridge. Seconds, not minutes.
+
+  Bridge, for everything else:
     full(old, 0.70)                       serving
     + bridge(new, 0.27)                   Bridging     both serve once the frontend routes to the bridge
     - full(old)                           DrainingOld  prefill scaled to 0 first, then the slot; wait until its pods are gone
@@ -10,8 +19,11 @@ DynamoGraphDeployment) plus the model. Edit spec.model and the controller swaps 
     - bridge(new)                         Finalizing
     full(new, 0.70)                       Serving
 
-Each step is its own workers-only DynamoGraphDeployment ("slot") named <frontendGraph>-<swap>-<f|b><gen>, so the
-frontend graph's namespace-prefix discovery picks it up. Fulls always use host port set a, bridges set b.
+Each slot is its own workers-only DynamoGraphDeployment named <frontendGraph>-<swap>-<f|b><gen>, so the frontend
+graph's namespace-prefix discovery picks it up. Fulls always use host port set a, bridges set b. A slot loads
+--model from its set's link on each node (/data/hf/swap/<namespace>/<swap>-<set> -> a snapshot dir), which the
+controller points at the slot's version before it starts or reloads it, so a restarted worker comes back on the
+version its slot serves now.
 """
 from __future__ import annotations
 
@@ -35,8 +47,11 @@ ROLES = ("prefill", "decode")
 # Host ports (the workers run hostNetwork): index per (port set, role), as tools/gen-slot.sh.
 PORT_INDEX = {("a", "prefill"): 0, ("a", "decode"): 1, ("b", "prefill"): 2, ("b", "decode"): 3}
 SET_OF = {"full": "a", "bridge": "b"}
-# The DGD's own pod-template-hash label value is <dgd>-vllmprefillworker-<8 hex> and must stay <= 63 characters.
-MAX_SLOT_NAME = 36
+# The operator labels every worker pod nvidia.com/selector=<dgd>-<component, lower case>-<8 hex worker hash>, and a
+# label value must stay <= 63 characters.
+LABEL_MAX = 63
+LINK_ROOT = "/data/hf/swap"
+HF_ROOT = "/data/hf"
 
 DEFAULTS = {
     "frontendGraph": "lab",
@@ -45,6 +60,11 @@ DEFAULTS = {
     "readyTimeoutSeconds": 1800,
     "fullRetries": 1,
     "versionAlias": True,
+    "servedModelAliases": [],
+    "revision": "",
+    "reload": "Auto",
+    "fetch": {"hfEndpoint": "https://serverlessgpu.aifoundry.scicom.dev/hf", "tokenSecret": "aif-hub-token",
+              "timeoutSeconds": 3600},
 }
 
 
@@ -58,10 +78,24 @@ def with_defaults(spec: dict) -> dict:
     return s
 
 
-def config_hash(s: dict) -> str:
-    """What a full slot is: a change in any of these starts a swap. Bridge settings are not in it."""
-    key = {k: s.get(k) for k in ("model", "servedModelName", "versionAlias", "steady", "graph")}
+def config_hash(s: dict, without: tuple = ()) -> str:
+    """What a full slot is: a change in any of these starts a swap. Bridge, reload and fetch settings are not in it."""
+    key = {k: s.get(k) for k in ("model", "revision", "servedModelName", "servedModelAliases", "versionAlias",
+                                 "steady", "graph") if k not in without}
+    for k in ("revision", "servedModelAliases"):     # unset: hash as before they existed, so an upgrade starts no swap
+        if not key.get(k):
+            key.pop(k, None)
     return hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()[:10]
+
+
+def shape_hash(s: dict) -> str:
+    """The slot without its model: equal shapes mean only the weights would change."""
+    return config_hash(s, without=("model", "revision"))
+
+
+def model_ref(s: dict) -> str:
+    """spec.model, plus @revision when one is pinned."""
+    return f"{s['model']}@{s['revision']}" if s.get("revision") else s["model"]
 
 
 def slot_name(s: dict, swap: str, kind: str, gen: int) -> str:
@@ -84,12 +118,48 @@ def validate(s: dict, swap: str) -> str:
     for c in comps:
         if not _gpus_of(c):
             return f"component {c.get('name')} has no {A_GPUS} annotation; pin its cards"
+        if not _node_of(c):
+            return f"component {c.get('name')} has no nodeSelector kubernetes.io/hostname; pin its node"
     total = int(s["steady"]["gpumemPercentage"]) + int(s["bridge"]["gpumemPercentage"])
     if total > 100:
         return f"steady + bridge gpumem is {total}% > 100: the bridge and a full engine must fit on the same cards"
-    if len(slot_name(s, swap, "bridge", 9999)) > MAX_SLOT_NAME:
-        return f"names too long: {slot_name(s, swap, 'bridge', 9999)} exceeds {MAX_SLOT_NAME} characters"
+    longest = max(len(str(c.get("name") or "")) for c in comps)
+    label = len(slot_name(s, swap, "bridge", 999)) + 1 + longest + 1 + 8
+    if label > LABEL_MAX:
+        return (f"names too long: {slot_name(s, swap, 'bridge', 999)}-<component>-<hash> is {label} characters "
+                f"(> {LABEL_MAX}); shorten the swap name or the component names")
+    if s["reload"] not in ("Auto", "Bridge"):
+        return f"spec.reload must be Auto or Bridge (got {s['reload']!r})"
     return ""
+
+
+def _node_of(component: dict) -> str:
+    spec = (component.get("podTemplate") or {}).get("spec") or {}
+    return (spec.get("nodeSelector") or {}).get("kubernetes.io/hostname") or ""
+
+
+def graph_nodes(s: dict) -> list[str]:
+    """The nodes the slots run on: where the download gate and the model links must be."""
+    return sorted({_node_of(c) for c in workers(s).values()})
+
+
+def link_path(namespace: str, swap: str, kind: str) -> str:
+    return f"{LINK_ROOT}/{namespace}/{swap}-{SET_OF[kind]}"
+
+
+def inplace_ok(s: dict, active: dict | None, cand: dict) -> tuple[bool, str]:
+    """Can the active full slot load cand's weights in place instead of bridging? (ok, why not)."""
+    if s["reload"] != "Auto":
+        return False, "spec.reload is Bridge"
+    if s["versionAlias"]:
+        return False, "spec.versionAlias is on (a slot's served names cannot change while it runs)"
+    if not active or not active.get("snapshot"):
+        return False, "the serving slot does not load from a model link (it predates in-place reloads)"
+    if active.get("shape") != shape_hash(s):
+        return False, "more than spec.model changed"
+    if not cand.get("compatible"):
+        return False, f"not weight-compatible: {cand.get('why')}"
+    return True, ""
 
 
 def _gpus_of(component: dict) -> list[str]:
@@ -131,8 +201,8 @@ def render_slot(swap: str, namespace: str, s: dict, slot: str, kind: str) -> dic
     """The workers-only DynamoGraphDeployment for one slot. kind: full | bridge."""
     pset = SET_OF[kind]
     util = s["steady"] if kind == "full" else s["bridge"]
-    names = [s["servedModelName"]] + ([s["model"]] if s.get("versionAlias") and s["model"] != s["servedModelName"]
-                                      else [])
+    names = list(dict.fromkeys([s["servedModelName"], *(s.get("servedModelAliases") or []),
+                                *([s["model"]] if s.get("versionAlias") else [])]))
     graph = copy.deepcopy(s["graph"])
     graph.pop("services", None)
     for comp in graph["components"]:
@@ -151,7 +221,7 @@ def render_slot(swap: str, namespace: str, s: dict, slot: str, kind: str) -> dic
                 cfg = json.loads(args[j + 1])
                 cfg["endpoint"] = f"tcp://*:{ports['kv']}"
                 args[j + 1] = json.dumps(cfg, separators=(",", ":"))
-        c["args"] = ["--model", s["model"], "--served-model-name", *names,
+        c["args"] = ["--model", link_path(namespace, swap, kind), "--served-model-name", *names,
                      "--gpu-memory-utilization", f"{float(util['gpuMemoryUtilization']):.2f}", *args]
         for p in c.get("ports") or []:
             if p.get("name") in ("system", "nixl"):
@@ -168,7 +238,7 @@ def render_slot(swap: str, namespace: str, s: dict, slot: str, kind: str) -> dic
         "kind": "DynamoGraphDeployment",
         "metadata": {"name": slot, "namespace": namespace,
                      "labels": {L_SWAP: swap, L_SLOT: slot, L_KIND: kind},
-                     "annotations": {f"{GROUP}/model": s["model"]}},
+                     "annotations": {f"{GROUP}/model": model_ref(s)}},
         "spec": graph,
     }
 
@@ -249,9 +319,9 @@ def gpu_preflight(pods: list[dict], gpus: list[str], pct: int) -> tuple[bool, st
 
 # ---------------------------------------------------------------- the swap state machine
 
-def _slot(s: dict, swap: str, kind: str, gen: int, now: float, attempts: int = 1) -> dict:
-    return {"slot": slot_name(s, swap, kind, gen), "kind": kind, "model": s["model"], "hash": config_hash(s),
-            "since": now, "attempts": attempts}
+def _slot(s: dict, swap: str, kind: str, gen: int, now: float, snapshot: str, attempts: int = 1) -> dict:
+    return {"slot": slot_name(s, swap, kind, gen), "kind": kind, "model": model_ref(s), "hash": config_hash(s),
+            "shape": shape_hash(s), "snapshot": snapshot, "since": now, "attempts": attempts}
 
 
 def _wait(slot: dict, slots: dict, timeout: float, now: float, acts: list) -> str:
@@ -268,14 +338,19 @@ def _wait(slot: dict, slots: dict, timeout: float, now: float, acts: list) -> st
     return "wait"
 
 
-def decide(swap: str, spec: dict, status: dict, slots: dict, preflight, now: float | None = None):
+def decide(swap: str, spec: dict, status: dict, slots: dict, preflight, now: float | None = None,
+           jobs: dict | None = None):
     """One step. slots: {slot: {state, listed, acked, retired, prefill}} for every slot seen in the cluster (retired: its
-    prefill is scaled to 0; prefill: "missing" once no prefill pod is left). preflight(pct) -> (ok, why).
+    prefill is scaled to 0; prefill: "missing" once no prefill pod is left). preflight(pct) -> (ok, why). jobs: {key:
+    {state: running|succeeded|failed, result, error}} for the node Jobs main ran, all nodes merged.
     Returns (actions, new_status); actions are ("create", kind, slot) / ("retire", slot) / ("delete", slot) /
-    ("probe", slot, model)."""
+    ("probe", slot, model) / ("job", key, mode, params) / ("reload", slot, params). main writes a reload's outcome to
+    status["reload"] before the next step."""
     now = time.time() if now is None else now
+    jobs = jobs or {}
     s = with_defaults(spec)
-    st = {k: v for k, v in (status or {}).items() if k not in ("kopf",)}
+    # A deep copy: main diffs the result against the CR's status to patch it, so nothing here may touch the input.
+    st = copy.deepcopy({k: v for k, v in (status or {}).items() if k not in ("kopf",)})
     acts: list = []
     err = validate(s, swap)
     if err:                                  # change nothing in the cluster; keep the phase so a fix resumes it
@@ -287,6 +362,7 @@ def decide(swap: str, spec: dict, status: dict, slots: dict, preflight, now: flo
     phase = st.get("phase") or "New"
     active, bridge, nxt, old = st.get("active"), st.get("bridge"), st.get("next"), st.get("old")
     gen = int(st.get("gen") or 0)
+    nodes = graph_nodes(s)
 
     def state(name):
         return (slots.get(name) or {}).get("state", "missing")
@@ -327,27 +403,150 @@ def decide(swap: str, spec: dict, status: dict, slots: dict, preflight, now: flo
             if name not in names:
                 remove(name)
 
+    def next_seq():
+        st["seq"] = int(st.get("seq") or 0) + 1
+        return st["seq"]
+
+    def gate():
+        """The download gate for the spec as it is now. (candidate, None) once the model is on every node, (None, None)
+        while the Jobs run, (None, error) when they failed."""
+        c = st.get("candidate")
+        if c and c.get("hash") == want and c.get("nodes") == nodes:
+            return c, None
+        f = st.get("fetching") or {}
+        if f.get("hash") != want or f.get("nodes") != nodes:
+            f = {"hash": want, "model": model_ref(s), "nodes": nodes, "key": f"fetch-{next_seq()}", "since": now}
+            st["fetching"] = f
+        j = jobs.get(f["key"]) or {}
+        if j.get("state") == "succeeded":
+            r = j.get("result") or {}
+            c = {"hash": want, "model": model_ref(s), "nodes": nodes, "snapshot": r.get("snapshot"),
+                 "compatible": bool(r.get("compatible")), "why": r.get("why", "")}
+            st.update(candidate=c, fetching=None)
+            return c, None
+        if j.get("state") == "failed" or now - f["since"] > float(s["fetch"]["timeoutSeconds"]):
+            st["fetching"] = None
+            return None, j.get("error") or f"no result in {s['fetch']['timeoutSeconds']} s"
+        if not j:
+            acts.append(("job", f["key"], "fetch", {"model": s["model"], "revision": s["revision"],
+                                                     "compare": (active or {}).get("snapshot") or ""}))
+        st["message"] = f"download gate: fetching and checking {model_ref(s)} on {', '.join(nodes)}"
+        return None, None
+
+    def linked(kind, target):
+        """Is the link of kind's port set pointing at target on every node? Asks main to point it there if not."""
+        pset = SET_OF[kind]
+        links = st.setdefault("links", {})
+        if links.get(pset) == {"target": target, "nodes": nodes}:
+            return True
+        p = st.get("linking") or {}
+        if (p.get("set"), p.get("target"), p.get("nodes")) != (pset, target, nodes):
+            p = {"set": pset, "target": target, "nodes": nodes, "key": f"link-{pset}-{next_seq()}"}
+            st["linking"] = p
+        j = jobs.get(p["key"]) or {}
+        if j.get("state") == "succeeded":
+            links[pset] = {"target": target, "nodes": nodes}
+            st["linking"] = None
+            return True
+        if j.get("state") == "failed":
+            st.update(linking=None, message=f"pointing link {pset} at {target} failed ({j.get('error')}); retrying")
+            return False
+        if not j:
+            acts.append(("job", p["key"], "link", {"kind": kind, "target": target}))
+        st["message"] = f"pointing link {pset} at {target.rsplit('/snapshots/', 1)[0].rsplit('/', 1)[-1]}"
+        return False
+
+    def start_bridge(cand):
+        if not linked("bridge", cand["snapshot"]):
+            return
+        slot = _slot(s, swap, "bridge", gen + 1, now, cand["snapshot"])
+        if create("bridge", slot, s["bridge"]["gpumemPercentage"]):
+            st.update(gen=gen + 1, bridge=slot, phase="Bridging", failedHash=None,
+                      message=f"bridge {slot['slot']} ({model_ref(s)}) loading beside {active['slot']}")
+
     if phase in ("New", "Failed", "Invalid") and not active and not nxt:
         keep_only()
-        if want != st.get("failedHash"):
-            cand = _slot(s, swap, "full", gen + 1, now)
-            if create("full", cand, s["steady"]["gpumemPercentage"]):
-                st.update(gen=gen + 1, next=cand, phase="Loading", message=f"loading {cand['slot']} ({s['model']})")
-        return acts, _finish(st, slots)
+        if want == st.get("failedHash"):
+            return acts, _finish(st, slots)
+        st.update(phase="Fetching", resume="New")
+        phase = "Fetching"
 
-    if phase == "Serving" and state(active["slot"]) == "missing":
+    if phase in ("Serving", "Fetching", "Reloading") and active and state(active["slot"]) == "missing":
         st.update(phase="New", active=None, message=f"active slot {active['slot']} vanished; loading a new one")
         return acts, _finish(st, slots)
 
     if phase == "Serving":
         keep_only(active["slot"])
         if want not in (active["hash"], st.get("failedHash")):
-            cand = _slot(s, swap, "bridge", gen + 1, now)
-            if create("bridge", cand, s["bridge"]["gpumemPercentage"]):
-                st.update(gen=gen + 1, bridge=cand, phase="Bridging", failedHash=None,
-                          message=f"bridge {cand['slot']} ({s['model']}) loading beside {active['slot']}")
-        elif want == active["hash"]:
-            st["message"] = f"serving {active['model']} from {active['slot']}"
+            st.update(phase="Fetching", resume="Serving")
+            phase = "Fetching"
+        else:
+            if want == active["hash"]:
+                st["message"] = f"serving {active['model']} from {active['slot']}"
+            return acts, _finish(st, slots)
+
+    if phase == "Degraded" and nxt is None:     # serving on the bridge only: retry once the spec changes
+        keep_only(bridge["slot"])
+        if want != st.get("failedHash") and state(slot_name(s, swap, "full", gen)) == "missing":
+            st.update(phase="Fetching", resume="Degraded")
+            phase = "Fetching"
+        else:
+            return acts, _finish(st, slots)
+
+    if phase == "Fetching":
+        frm = st.get("resume") or "New"
+        if frm == "Serving" and want == active["hash"]:      # edited back before the gate finished
+            st.update(phase="Serving", fetching=None, message=f"serving {active['model']} from {active['slot']}")
+            return acts, _finish(st, slots)
+        keep_only(*[x["slot"] for x in (active, bridge) if x])
+        cand, err = gate()
+        if err:
+            st.update(phase={"New": "Failed"}.get(frm, frm), failedHash=want,
+                      lastFailure=f"download gate for {model_ref(s)}: {err}",
+                      message=f"download gate failed for {model_ref(s)}: {err}"[:300])
+            return acts, _finish(st, slots)
+        if cand is None:
+            return acts, _finish(st, slots)
+        if frm == "Serving":
+            ok, why = inplace_ok(s, active, cand)
+            if ok:
+                st.update(phase="Reloading", reload=None,
+                          message=f"{model_ref(s)} differs from {active['model']} only in its weights; reloading in place")
+            else:
+                st["bridgeReason"] = why
+                start_bridge(cand)
+            return acts, _finish(st, slots)
+        g = gen + 1 if frm == "New" else gen            # Degraded: the full of the bridge's generation
+        if linked("full", cand["snapshot"]):
+            slot = _slot(s, swap, "full", g, now, cand["snapshot"])
+            if create("full", slot, s["steady"]["gpumemPercentage"]):
+                beside = f" beside {bridge['slot']}" if bridge else ""
+                st.update(gen=g, next=slot, phase="Loading", message=f"loading {slot['slot']} ({model_ref(s)}){beside}")
+        return acts, _finish(st, slots)
+
+    if phase == "Reloading":
+        cand = st.get("candidate") or {}
+        if cand.get("hash") != want:                 # edited again before the reload ran
+            st.update(phase="Serving" if want == active["hash"] else "Fetching", resume="Serving")
+            return acts, _finish(st, slots)
+        r = st.get("reload") or {}
+        if r.get("hash") != want:                    # not run yet: point the slot's link first, then reload
+            if linked("full", cand["snapshot"]):
+                acts.append(("reload", active["slot"], {"hash": want, "to": cand["snapshot"], "from": active["snapshot"],
+                                                         "version": cand["model"].rsplit("/", 1)[-1]}))
+                st["message"] = f"reloading {active['slot']} in place: {active['model']} -> {cand['model']}"
+            return acts, _finish(st, slots)
+        if r.get("ok"):
+            st.update(phase="Serving", failedHash=None,
+                      active={**active, "model": cand["model"], "hash": want, "snapshot": cand["snapshot"]},
+                      message=f"serving {cand['model']} from {active['slot']}, reloaded in place "
+                              f"(no new tokens for {r.get('pausedSeconds')} s)")
+            return acts, _finish(st, slots)
+        # Failed: main already put the old weights back. Point the link back too, then bridge as for any other change.
+        st["lastFailure"] = f"in-place reload to {cand['model']} failed: {r.get('why')}; old weights restored"
+        if linked("full", active["snapshot"]):
+            st["bridgeReason"] = "in-place reload failed"
+            start_bridge(cand)
         return acts, _finish(st, slots)
 
     if phase == "Bridging":
@@ -374,25 +573,28 @@ def decide(swap: str, spec: dict, status: dict, slots: dict, preflight, now: flo
         if not gone:
             st["message"] = f"draining {old['slot']}: {why}"
             return acts, _finish(st, slots)
-        # Rendered from the spec as it is now: an edit made during the swap wins here.
-        cand = _slot(s, swap, "full", gen, now)
-        if create("full", cand, s["steady"]["gpumemPercentage"]):
-            st.update(phase="Loading", next=cand, old=None,
-                      message=f"{old['slot']} gone; loading {cand['slot']} beside {bridge['slot']}")
+        # Rendered from the spec as it is now: an edit made during the swap wins here (after its own download gate).
+        cand, err = gate()
+        if err:
+            st.update(phase="Degraded", old=None, failedHash=want, lastFailure=f"download gate for {model_ref(s)}: {err}",
+                      message=f"download gate failed; serving on bridge {bridge['slot']} only")
+            return acts, _finish(st, slots)
+        if cand is None:
+            return acts, _finish(st, slots)
+        if linked("full", cand["snapshot"]):        # the old full is gone, so set a's link is free to move
+            slot = _slot(s, swap, "full", gen, now, cand["snapshot"])
+            if create("full", slot, s["steady"]["gpumemPercentage"]):
+                st.update(phase="Loading", next=slot, old=None,
+                          message=f"{old['slot']} gone; loading {slot['slot']} beside {bridge['slot']}")
         return acts, _finish(st, slots)
 
-    if phase in ("Loading", "Degraded"):
-        if nxt is None:                     # Degraded: retry only once the spec changes
-            if want != st.get("failedHash") and state(slot_name(s, swap, "full", gen)) == "missing":
-                cand = _slot(s, swap, "full", gen, now)
-                if create("full", cand, s["steady"]["gpumemPercentage"]):
-                    st.update(phase="Loading", next=cand, message=f"loading {cand['slot']} beside {bridge['slot']}")
-            return acts, _finish(st, slots)
+    if phase == "Loading":
         if nxt.get("retiring"):             # a failed attempt, waiting for its pods to go before the retry
             if state(nxt["slot"]) != "missing":
                 st["message"] = f"waiting for failed {nxt['slot']} to exit"
                 return acts, _finish(st, slots)
-            cand = _slot(s, swap, "full", gen, now, nxt["attempts"] + 1)
+            cand = _slot(s, swap, "full", gen, now, nxt["snapshot"], nxt["attempts"] + 1)
+            cand.update(model=nxt["model"], hash=nxt["hash"], shape=nxt["shape"])
             if create("full", cand, s["steady"]["gpumemPercentage"]):
                 st.update(next=cand, message=f"retrying {cand['slot']} (attempt {cand['attempts']})")
             return acts, _finish(st, slots)

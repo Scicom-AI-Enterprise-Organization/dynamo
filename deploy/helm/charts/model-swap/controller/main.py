@@ -9,6 +9,10 @@ the same sync (parking the lab) would hold the CR forever.
 `generate` instances in /health (its discovery sees them) and (2) has routed a request to the slot's decode instance
 (/metrics has a dynamo_frontend_worker_* series for its instance id). (2) comes from live traffic or, without
 traffic, from the controller's own probe requests.
+
+The download gate and the model links run as Jobs, one per node of the graph (fetch.py). An in-place reload calls the
+workers' admin routes (/engine/* on their system ports), which admin-port-guard only lets through from a node's own
+host network: this pod runs hostNetwork for that.
 """
 from __future__ import annotations
 
@@ -32,6 +36,9 @@ INTERVAL = 10
 DGD_GROUP, DGD_VERSION, DGD_PLURAL = "nvidia.com", "v1beta1", "dynamographdeployments"
 HISTORY = 40
 G_LABEL = "nvidia.com/dynamo-graph-deployment-name"
+L_JOB, L_NODE = f"{logic.GROUP}/job", f"{logic.GROUP}/node"
+PAUSE_CAP = float(os.environ.get("PAUSE_CAP_SECONDS", "60"))
+FETCH_SRC = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "fetch.py")).read()
 last_ok = time.time()
 
 
@@ -48,15 +55,203 @@ def http_get(url: str, timeout: float = 5) -> str | None:
 
 
 def probe(fe_ip: str, served: str) -> str:
-    body = json.dumps({"model": served, "max_tokens": 16, "temperature": 0,
+    """"200" when the frontend answers and the answer counts (greedy "1 2 3 4 5 ..."): a canary for weights that
+    load but are garbage. Else what went wrong."""
+    body = json.dumps({"model": served, "max_tokens": 24, "temperature": 0,
                        "messages": [{"role": "user", "content": "Count from 1 to 20, separated by spaces."}]}).encode()
     req = urllib.request.Request(f"http://{fe_ip}:8000/v1/chat/completions", data=body,
                                  headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=90) as r:
-            return str(r.status)
+            text = (json.loads(r.read()).get("choices") or [{}])[0].get("message", {}).get("content") or ""
+            if re.search(r"1\D+2\D+3\D+4\D+5", text):
+                return str(r.status)
+            return f"{r.status} but no count: {text[:40]!r}"
     except Exception as e:
         return f"{type(e).__name__}: {e}"[:120]
+
+
+# ---------------------------------------------------------------- node Jobs (download gate, model links)
+
+def _main_container(comp: dict) -> dict:
+    cs = ((comp.get("podTemplate") or {}).get("spec") or {}).get("containers") or [{}]
+    return next((c for c in cs if c.get("name") == "main"), cs[0])
+
+
+def job_body(cr: dict, s: dict, key: str, mode: str, params: dict, node: str, i: int) -> dict:
+    comp = next(iter(logic.workers(s).values()))
+    pod_spec = (comp.get("podTemplate") or {}).get("spec") or {}
+    f = s["fetch"]
+    name = cr["metadata"]["name"]
+    env = [{"name": "MODE", "value": mode}, {"name": "HF_HOME", "value": logic.HF_ROOT},
+           {"name": "HF_ENDPOINT", "value": f["hfEndpoint"]}, {"name": "HF_HUB_DISABLE_XET", "value": "1"},
+           # the image sets NVIDIA_VISIBLE_DEVICES=all: no GPUs for a download
+           {"name": "NVIDIA_VISIBLE_DEVICES", "value": "void"},
+           {"name": "HF_TOKEN", "valueFrom": {"secretKeyRef": {"name": f["tokenSecret"], "key": "token",
+                                                               "optional": True}}}]
+    if mode == "fetch":
+        env += [{"name": "MODEL", "value": params["model"]}, {"name": "REVISION", "value": params["revision"]},
+                {"name": "COMPARE", "value": params["compare"]}]
+    else:
+        env += [{"name": "LINK", "value": logic.link_path(NS, name, params["kind"])},
+                {"name": "TARGET", "value": params["target"]}]
+    labels = {logic.L_SWAP: name, L_JOB: key, L_NODE: node}
+    return {
+        "apiVersion": "batch/v1", "kind": "Job",
+        "metadata": {"name": f"dms-{name}-{key}-{i}", "namespace": NS, "labels": labels,
+                     "ownerReferences": [{"apiVersion": cr["apiVersion"], "kind": cr["kind"], "name": name,
+                                          "uid": cr["metadata"]["uid"], "controller": True}]},
+        "spec": {
+            "backoffLimit": 0, "ttlSecondsAfterFinished": 1800, "activeDeadlineSeconds": int(f["timeoutSeconds"]),
+            "template": {"metadata": {"labels": labels}, "spec": {
+                "restartPolicy": "Never",
+                "nodeSelector": {"kubernetes.io/hostname": node},
+                "tolerations": [{"operator": "Exists"}],
+                "imagePullSecrets": pod_spec.get("imagePullSecrets") or [],
+                "volumes": [{"name": "hf", "hostPath": {"path": logic.HF_ROOT, "type": "Directory"}}],
+                "containers": [{
+                    "name": mode, "image": f.get("image") or _main_container(comp)["image"],
+                    "imagePullPolicy": "IfNotPresent", "command": ["python3", "-c", FETCH_SRC], "env": env,
+                    "securityContext": {"runAsUser": 0},
+                    "resources": {"requests": {"cpu": "1", "memory": "1Gi"}, "limits": {"memory": "8Gi"}},
+                    "volumeMounts": [{"name": "hf", "mountPath": logic.HF_ROOT}]}]}}}}
+
+
+def ensure_job(cr: dict, s: dict, key: str, mode: str, params: dict) -> None:
+    batch = client.BatchV1Api()
+    for i, node in enumerate(logic.graph_nodes(s)):
+        try:
+            batch.create_namespaced_job(NS, job_body(cr, s, key, mode, params, node, i))
+            log(f"{cr['metadata']['name']}: job {key} ({mode}) on {node}")
+        except ApiException as e:
+            if e.status != 409:
+                raise
+
+
+def job_views(name: str) -> dict:
+    """{key: {state, result, error}} with every node's Job of a key merged: failed if one failed, succeeded once all
+    did. A fetch's nodes must hold the same snapshot (revision) of the model."""
+    sel = f"{logic.L_SWAP}={name},{L_JOB}"
+    msgs = {}
+    for p in client.CoreV1Api().list_namespaced_pod(NS, label_selector=sel).items:
+        for cs in p.status.container_statuses or []:
+            if cs.state and cs.state.terminated and cs.state.terminated.message:
+                msgs[(p.metadata.labels or {}).get("job-name")] = cs.state.terminated.message
+    by_key: dict = {}
+    for j in client.BatchV1Api().list_namespaced_job(NS, label_selector=sel).items:
+        lb = j.metadata.labels or {}
+        st = j.status
+        failed = (st.failed or 0) > 0 or any(c.type == "Failed" and c.status == "True" for c in st.conditions or [])
+        state = "succeeded" if (st.succeeded or 0) > 0 else "failed" if failed else "running"
+        try:
+            res = json.loads(msgs.get(j.metadata.name) or "{}")
+        except ValueError:
+            res = {"error": (msgs.get(j.metadata.name) or "")[:300]}
+        by_key.setdefault(lb.get(L_JOB), []).append((lb.get(L_NODE), state, res))
+    views = {}
+    for key, items in by_key.items():
+        bad = [f"{n}: {r.get('error') or 'job failed'}" for n, st, r in items if st == "failed"]
+        if bad:
+            views[key] = {"state": "failed", "error": "; ".join(bad)[:500]}
+        elif all(st == "succeeded" for _, st, _ in items):
+            rs = [r for _, _, r in items]
+            snaps = {r.get("snapshot") for r in rs if "snapshot" in r}
+            if len(snaps) > 1:
+                views[key] = {"state": "failed", "error": f"nodes hold different revisions: {sorted(snaps)}"}
+                continue
+            notc = [r for r in rs if "compatible" in r and not r["compatible"]]
+            views[key] = {"state": "succeeded", "result": {
+                "snapshot": snaps.pop() if snaps else None,
+                "compatible": bool(rs) and all(r.get("compatible") for r in rs),
+                "why": (notc[0] if notc else rs[0]).get("why", "")}}
+        else:
+            views[key] = {"state": "running"}
+    return views
+
+
+# ---------------------------------------------------------------- in-place reload (the workers' admin routes)
+
+def admin(addr: tuple, route: str, body: dict, timeout: float) -> dict:
+    req = urllib.request.Request(f"http://{addr[0]}:{addr[1]}/engine/{route}", data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read() or b"{}")
+
+
+def slot_workers(slot: str) -> dict:
+    """{role: (host ip, system port)} of a slot's Ready prefill and decode pods (hostNetwork: pod IP = host IP)."""
+    out = {}
+    for p in client.CoreV1Api().list_namespaced_pod(NS, label_selector=f"{G_LABEL}={slot}").items:
+        role = (p.metadata.labels or {}).get("nvidia.com/dynamo-component-type")
+        if role not in logic.ROLES or logic.pod_state(_api(p)) != "ready":
+            continue
+        c = next((c for c in p.spec.containers if c.name == "main"), p.spec.containers[0])
+        port = next((e.value for e in c.env or [] if e.name == "DYN_SYSTEM_PORT"), None)
+        if role in out or not port:
+            raise RuntimeError(f"slot {slot}: expected one Ready {role} pod with DYN_SYSTEM_PORT")
+        out[role] = (p.status.pod_ip, int(port))
+    if set(out) != set(logic.ROLES):
+        raise RuntimeError(f"slot {slot}: Ready workers are {sorted(out)}, not prefill + decode")
+    return out
+
+
+def reload_in_place(slot: str, p: dict, fe_ips: list[str], served: str) -> dict:
+    """Pause prefill then decode (wait mode: running requests finish, new ones queue; at most PAUSE_CAP s each), load
+    p["to"] into both, resume decode then prefill, then check both report the new version and the frontends answer.
+    Any failure loads p["from"] back. Returns the outcome decide() reads from status["reload"]."""
+    res = {"hash": p["hash"], "ok": False, "to": p["to"]}
+    roles = ("prefill", "decode")
+    try:
+        w = slot_workers(slot)
+    except Exception as e:
+        return {**res, "why": str(e)[:300]}
+
+    def each(route, body, timeout, order=roles):
+        out = {}
+        with ThreadPoolExecutor(2) as ex:
+            futs = {r: ex.submit(admin, w[r], route, body, timeout) for r in order}
+            for r, fu in futs.items():
+                try:
+                    out[r] = fu.result()
+                except Exception as e:
+                    out[r] = {"status": "error", "message": f"{type(e).__name__}: {e}"[:200]}
+        return out
+
+    def resume():                       # decode first, so the prefill's first new requests find it ready
+        return {r: admin(w[r], "resume_generation", {}, 600) for r in ("decode", "prefill")}
+
+    def back(why):
+        """Old weights back in (the engines must be paused), resume, and report why."""
+        rb = each("update_weights_from_disk", {"model_path": p["from"], "weight_version": "rollback"}, 900)
+        rs = resume()
+        ok = all(x.get("status") == "ok" for x in [*rb.values(), *rs.values()])
+        log(f"{slot}: rolled back to {p['from']}: {'ok' if ok else rb}")
+        return {**res, "why": why[:300], "rolledBack": ok}
+
+    t0 = time.time()
+    for r in roles:
+        try:
+            x = admin(w[r], "pause_generation", {"mode": "wait"}, PAUSE_CAP)
+            if x.get("status") != "ok":
+                raise RuntimeError(x.get("message"))
+        except Exception as e:
+            resume()                    # a pause still draining finishes first, then this resumes it
+            return {**res, "why": f"pause {r} did not finish in {PAUSE_CAP:.0f} s: {e}"[:300]}
+    t_paused = time.time()
+    up = each("update_weights_from_disk", {"model_path": p["to"], "weight_version": p["version"]}, 900)
+    t_loaded = time.time()
+    if any(x.get("status") != "ok" for x in up.values()):
+        return back(f"update_weights_from_disk: {up}")
+    resume()
+    t_resumed = time.time()
+    versions = {r: admin(w[r], "get_weight_version", {}, 10).get("version") for r in roles}
+    probes = [probe(ip, served) for ip in fe_ips for _ in range(2)]
+    if any(v != p["version"] for v in versions.values()) or any(x != "200" for x in probes) or not probes:
+        for r in roles:
+            admin(w[r], "pause_generation", {"mode": "wait"}, max(PAUSE_CAP, 120))
+        return back(f"check failed: versions {versions}, probes {probes}")
+    return {**res, "ok": True, "pausedSeconds": round(t_resumed - t0, 1), "drainSeconds": round(t_paused - t0, 1),
+            "loadSeconds": round(t_loaded - t_paused, 1), "probes": probes}
 
 
 def frontends(s: dict) -> list:
@@ -157,10 +352,20 @@ def reconcile(cr: dict) -> None:
             cache.extend(_api(p) for p in core.list_pod_for_all_namespaces().items)
         return logic.gpu_preflight(cache, logic.graph_gpus(s), int(pct))
 
-    acts, new = logic.decide(name, spec, status, slots, preflight, time.time())
+    acts, new = logic.decide(name, spec, status, slots, preflight, time.time(), job_views(name))
 
     for act in acts:
-        if act[0] == "create":
+        if act[0] == "job":
+            ensure_job(cr, s, act[1], act[2], act[3])
+        elif act[0] == "reload":
+            log(f"{name}: reloading {act[1]} in place: {act[2]['from']} -> {act[2]['to']}")
+            out = reload_in_place(act[1], act[2], [p.status.pod_ip for p in fe], s["servedModelName"])
+            new["reload"] = out
+            log(f"{name}: in-place reload of {act[1]}: {out}")
+            if out["ok"]:
+                co.patch_namespaced_custom_object(DGD_GROUP, DGD_VERSION, NS, DGD_PLURAL, act[1], {
+                    "metadata": {"annotations": {f"{logic.GROUP}/model": logic.model_ref(s)}}})
+        elif act[0] == "create":
             body = logic.render_slot(name, NS, s, act[2], act[1])
             # Owner reference only, no ArgoCD tracking label: ArgoCD shows the slot under the CR and never prunes it.
             body["metadata"]["ownerReferences"] = [{"apiVersion": cr["apiVersion"], "kind": cr["kind"], "name": name,
@@ -245,7 +450,7 @@ if __name__ == "__main__":
         config.load_incluster_config()
     except config.ConfigException:
         config.load_kube_config()
-    threading.Thread(target=http.server.ThreadingHTTPServer(("0.0.0.0", 8080), Health).serve_forever,
+    threading.Thread(target=http.server.ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("HEALTH_PORT", "8080"))), Health).serve_forever,
                      daemon=True).start()
     log(f"watching {logic.PLURAL}.{logic.GROUP} in {NS}")
     loop()

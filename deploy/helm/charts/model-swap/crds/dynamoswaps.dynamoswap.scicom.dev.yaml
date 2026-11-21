@@ -1,13 +1,19 @@
 # DynamoModelSwap: one Dynamo prefill + decode pair whose model changes with no downtime on one replica. Edit
-# spec.model (or anything in spec) and the model-swap controller runs the swap by itself: a bridge copy of the new
-# model at 0.27 beside the old at 0.70, the old removed once the frontend routes to the bridge, the new at 0.70 once
-# the old is gone, then the bridge removed. --served-model-name stays spec.servedModelName throughout.
+# spec.model or spec.revision (or anything in spec) and the model-swap controller runs the swap by itself: a download
+# gate on every node of the graph, then an in-place reload of the running pair when only the weights change, or else a
+# bridge copy of the new model at 0.27 beside the old at 0.70, the old removed once the frontend routes to the bridge,
+# the new at 0.70 once the old is gone, then the bridge removed. --served-model-name stays spec.servedModelName.
 # Helm installs this file on the first install only and never upgrades or deletes it: apply schema changes with
-# kubectl apply -f. Same schema as the B300 reload lab (b300-bangkok argocd/apps/reload-lab/swap-crd.yaml).
+# kubectl apply -f. Under Argo CD it is synced like any manifest, and the annotations below keep it when its
+# Application is deleted or stops rendering it: deleting this CRD deletes every DynamoModelSwap in the cluster, and
+# with them (owner references) every slot they serve from.
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   name: dynamoswaps.dynamoswap.scicom.dev
+  annotations:
+    helm.sh/resource-policy: keep
+    argocd.argoproj.io/sync-options: Delete=false,Prune=false
 spec:
   group: dynamoswap.scicom.dev
   scope: Namespaced
@@ -38,14 +44,34 @@ spec:
               properties:
                 model:
                   type: string
-                  description: HF repo id (read from /data/hf, HF_HUB_OFFLINE). The one field to edit for a swap.
+                  description: HF repo id. The one field to edit for a swap. The download gate fetches it into each node's /data/hf (from the AI Foundry hub with fetch.tokenSecret, or offline when that Secret is absent); the engines stay HF_HUB_OFFLINE.
+                revision:
+                  type: string
+                  default: ""
+                  description: Optional full commit hash (or a branch the nodes have) of spec.model. Empty = main. A new revision of the same model is a swap like any other, usually in place.
+                reload:
+                  type: string
+                  enum: [Auto, Bridge]
+                  default: Auto
+                  description: Auto reloads the running pair in place when only the weights change (needs versionAlias false); Bridge always swaps through a 0.27 bridge.
+                fetch:
+                  type: object
+                  properties:
+                    image: {type: string, description: "Image of the gate Jobs (default: the graph's own runtime image)."}
+                    hfEndpoint: {type: string}
+                    tokenSecret: {type: string, description: "Secret with key token for the hub (default aif-hub-token; optional)."}
+                    timeoutSeconds: {type: integer}
                 servedModelName:
                   type: string
                   description: The name callers send. Every slot registers it as its primary name, so it never changes.
+                servedModelAliases:
+                  type: array
+                  items: {type: string}
+                  description: More names every slot serves, fixed across swaps (e.g. the name callers sent before servedModelName existed). Changing them is a bridge swap.
                 versionAlias:
                   type: boolean
                   default: true
-                  description: Also register spec.model as an alias, so a caller can pin one version during a swap.
+                  description: Also register spec.model as an alias, so a caller can pin one version during a swap. A running slot's names cannot change, so in-place reloads need it off.
                 frontendGraph:
                   type: string
                   default: lab

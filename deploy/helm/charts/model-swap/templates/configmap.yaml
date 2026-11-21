@@ -1,4 +1,4 @@
-# The controller code (controller/main.py and controller/logic.py), mounted at /app in the controller pod.
+# The controller code (controller/*.py: main, logic, and fetch, the node Job's script), mounted at /app.
 apiVersion: v1
 kind: ConfigMap
 metadata:

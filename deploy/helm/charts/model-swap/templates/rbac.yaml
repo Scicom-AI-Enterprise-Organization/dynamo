@@ -1,5 +1,6 @@
 # The controller reads its DynamoModelSwaps and writes their status, and creates, patches (a slot's prefill to 0
-# replicas) and deletes only the DynamoGraphDeployments it owns, all in the watched namespace.
+# replicas) and deletes only the DynamoGraphDeployments and Jobs (download gate, model links) it owns, all in the
+# watched namespace.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -25,6 +26,9 @@ rules:
   - apiGroups: [nvidia.com]
     resources: [dynamographdeployments]
     verbs: [get, list, create, patch, delete]
+  - apiGroups: [batch]
+    resources: [jobs]
+    verbs: [get, list, create, delete]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

@@ -2,7 +2,9 @@ apiVersion: v2
 name: model-swap
 description: |
   DynamoModelSwap: change the model of a one-replica Dynamo prefill + decode pair with no downtime, from one
-  edit of spec.model. A small controller brings the new model up at a low --gpu-memory-utilization beside the
+  edit of spec.model. A download gate fetches and checks the new weights on every node first. When only the
+  weights change, the controller reloads them into the running engines in seconds (pause, load, resume, check;
+  rolled back on any failure). Otherwise it brings the new model up at a low --gpu-memory-utilization beside the
   old one on the same GPUs, removes the old one once the Dynamo frontend routes to the new copy, brings the new
   model up at full size, then removes the small copy. Callers keep one --served-model-name throughout.
 
@@ -11,9 +13,9 @@ description: |
   release with v1beta1 DynamoGraphDeployments) and HAMi for GPU pinning and sharing. Scicom add-on; not in
   upstream ai-dynamo/dynamo.
 type: application
-version: 0.1.0
+version: 0.2.0
 # appVersion tracks the controller code in controller/ (shipped in a ConfigMap, run on a stock python image).
-appVersion: "0.1.0"
+appVersion: "0.2.0"
 keywords:
   - dynamo
   - vllm
