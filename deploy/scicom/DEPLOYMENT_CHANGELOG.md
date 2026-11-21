@@ -33,6 +33,7 @@ Each commit is a `cherry-pick -x` of its 1.5.0 commit, including the two of
 | (new) | `7a2e5fa3fd` | Upstream 1.6 has a second gemma4 gate, in the unified (v2) parser path, that still turned reasoning off unless `enable_thinking=true`. `DYN_PARSER_VERSION=auto` sends gemma4 down the legacy path, so the leak only came back with `DYN_PARSER_VERSION=2`; this keeps the parser on there too and updates upstream's two raw-batch tests. The SGLang gate is left as upstream has it. |
 | (new) | `fa968622af` | Test-only: restores a closing brace lost while keeping both sets of tests at the end of `postprocessor_parsing_stream.rs`. |
 | (new) | `fcabb499e4`, merged by `f3af890c8b` (2026-11-21) | `deploy/helm/charts/model-swap`, from `feat/dynamo-model-swap`; see below. Deployment-only. |
+| (new) | `62ee582315`, merged 2026-11-21 | model-swap 0.2.0: download gate and in-place reload; see below. Deployment-only. |
 
 ### Model swap with no downtime: `deploy/helm/charts/model-swap` (2026-11-21)
 
@@ -42,7 +43,17 @@ old 0.70, the old removed once the frontend routes to the bridge, then the new 0
 runtime, the frontend, the operator or the vLLM patch, so the release tag `v1.6.0-nightly-20261016-gemma4-hetero-tp.1`
 and its images stay at `197b12e`, and nothing needs a rebuild. The same controller code ran the B300 node-2 reload lab
 on 2026-11-21 from b300-bangkok (`argocd/apps/reload-lab`, branch `exp/zero-downtime-reload`, commit `2839b82`): 0 of
-15,381 requests failed during a swap under load. Nothing is deployed from this chart yet. See the chart's `README.md`.
+15,381 requests failed during a swap under load. See the chart's `README.md`.
+
+**0.2.0** (`62ee582315`): every swap first runs a download gate, a Job per node that fetches the model (and
+`spec.revision`), checks every shard's safetensors header and compares config, tokenizer, chat template and tensor
+names with the serving snapshot. When only the weights differ, the controller reloads the running pair in place
+through the workers' `/engine/` routes (`pause_generation` in `wait` mode with a 60 s cap, `update_weights_from_disk`,
+`resume_generation`, then a version check and a counting canary), puts the old weights back on any failure and falls
+back to the bridge. New fields: `revision`, `reload`, `fetch`, `servedModelAliases`. The controller runs on the host
+network. Ran on B300 node-2 on 2026-11-21, from the lab copy and then from this chart (b300-bangkok `879501c`): a gated
+bridge swap with 0 of 15,841 requests failed, and two in-place reloads of v20a with 0 of 745 and 0 of 644 failed and
+10.3 s and 16.3 s without new tokens. Still deployment-only: the release tag and its images stay at `197b12e`.
 
 ### Prefill and decode with different TP (gemma-4)
 
