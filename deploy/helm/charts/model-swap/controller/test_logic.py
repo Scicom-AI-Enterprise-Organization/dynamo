@@ -8,11 +8,13 @@ V1, V2, V3 = "org/model-v1", "org/model-v2", "org/model-v3"
 GPUS = "GPU-a,GPU-b"
 
 
-def spec(model, alias=True, nodes=("node-2", "node-2"), names=("prefill", "decode"), **kw):
+def spec(model, alias=True, nodes=("node-2", "node-2"), names=("prefill", "decode"), cache_vol=False, **kw):
+    vols = [{"name": logic.CACHE_VOLUME, "hostPath": {"path": "/data/vllm-cache/ns"}}] if cache_vol else []
+
     def worker(t, node, name):
         return {"name": name, "type": t, "podTemplate": {
             "metadata": {"annotations": {logic.A_GPUS: GPUS}},
-            "spec": {"nodeSelector": {"kubernetes.io/hostname": node},
+            "spec": {"nodeSelector": {"kubernetes.io/hostname": node}, "volumes": vols,
                      "containers": [{"name": "main", "args": ["--model", "x", "--gpu-memory-utilization", "0.9",
                                                               "--served-model-name", "a", "b", "--block-size", "64"]}]}}}
     return {"model": model, "servedModelName": "served", "versionAlias": alias,
@@ -30,8 +32,9 @@ class World:
     job: ticks a node Job takes. compatible(old, new) says what the gate finds."""
 
     def __init__(self, load=3, ack=2, exit=2, job=1, fail=(), fetch_fail=(), reload_fail=(),
-                 compatible=lambda old, new: True):
+                 compatible=lambda old, new: True, seed="ok", store=True):
         self.load, self.ack, self.exit, self.job, self.fail = load, ack, exit, job, set(fail)
+        self.seed, self.store = seed, store             # seed: ok | fail | hang (what the cache-seed Jobs do)
         self.fetch_fail, self.reload_fail, self.compatible = set(fetch_fail), set(reload_fail), compatible
         self.slots, self.jobs, self.links, self.t, self.log, self.status = {}, {}, {}, 0, [], {}
 
@@ -55,8 +58,10 @@ class World:
     def job_view(self):
         out = {}
         for k, j in self.jobs.items():
-            if self.t - j["born"] < self.job:
+            if self.t - j["born"] < self.job or j["mode"] == "cache-seed" and self.seed == "hang":
                 out[k] = {"state": "running"}
+            elif j["mode"] == "cache-seed" and self.seed == "fail":
+                out[k] = {"state": "failed", "error": "store unreachable"}
             elif j["mode"] == "fetch" and j["p"]["model"] in self.fetch_fail:
                 out[k] = {"state": "failed", "error": "shard missing"}
             elif j["mode"] == "fetch":
@@ -78,7 +83,7 @@ class World:
             sp = spec(sp)
         before = json.dumps(self.status, sort_keys=True)
         acts, new = logic.decide("sw", sp, self.status, self.view(), self.preflight,
-                                 now if now is not None else self.t, self.job_view())
+                                 now if now is not None else self.t, self.job_view(), self.store)
         assert json.dumps(self.status, sort_keys=True) == before, "decide() changed the status it was given"
         self.status = json.loads(json.dumps(new))      # as the CR stores it
         s = logic.with_defaults(sp)
@@ -319,3 +324,65 @@ def test_static_aliases_are_served_and_are_part_of_the_slot():
     assert logic.shape_hash(s) != logic.shape_hash(logic.with_defaults(spec(V1, alias=False)))
     assert logic.config_hash(logic.with_defaults({**spec(V1), "servedModelAliases": []})) == \
         logic.config_hash(logic.with_defaults(spec(V1)))
+
+
+# ---------------------------------------------------------------- compile-cache seeding
+
+def jobs_of(w, mode):
+    return [j for j in w.jobs.values() if j["mode"] == mode]
+
+
+def test_cache_seed_runs_beside_the_gate_and_each_slot_publishes_once_it_serves():
+    w = World(job=3)
+    w.run(spec(V1, cache_vol=True), serving(V1))
+    (fetch,), (seed,) = jobs_of(w, "fetch"), jobs_of(w, "cache-seed")
+    assert seed["born"] == fetch["born"]                          # beside the download gate, not after it
+    assert w.slots["lab-sw-f1"]["born"] >= seed["born"] + w.job   # the engine starts once seeding is done
+    for _ in range(5):
+        w.step(spec(V1, cache_vol=True))
+    assert [j["p"]["slot"] for j in jobs_of(w, "cache-publish")] == ["lab-sw-f1"]
+    w.run(spec(V2, cache_vol=True), serving(V2))                  # a bridge swap: seeds again, publishes both slots
+    w.step(spec(V2, cache_vol=True))
+    assert len(jobs_of(w, "cache-seed")) == 2
+    assert [j["p"]["slot"] for j in jobs_of(w, "cache-publish")] == ["lab-sw-f1", "lab-sw-b2", "lab-sw-f2"]
+    assert w.status["seed"]["outcome"] == "seeded"
+
+
+def test_cache_seed_failure_or_hang_never_stops_a_swap(monkeypatch):
+    w = World(seed="fail")
+    w.run(spec(V1, cache_vol=True), serving(V1))
+    w.run(spec(V2, cache_vol=True), serving(V2))
+    assert w.status["seed"]["outcome"].startswith("failed, engines load without it")
+    monkeypatch.setattr(logic, "CACHE_TIMEOUT", 6)
+    w = World(seed="hang")
+    w.run(spec(V1, cache_vol=True), serving(V1))
+    born = jobs_of(w, "cache-seed")[0]["born"]
+    assert w.status["seed"]["outcome"].startswith("no result in 6 s")
+    assert born + 6 < w.slots["lab-sw-f1"]["born"] <= born + 8    # it waited for the seed, but only that long
+
+
+def test_cache_field_starts_no_swap_and_cold_runs_no_cache_jobs():
+    w = World()
+    w.run(spec(V1, cache_vol=True), serving(V1))
+    w.log.clear()
+    for _ in range(5):
+        w.step(spec(V1, cache_vol=True, cache="Cold"))
+    assert not w.slot_events() and w.status["phase"] == "Serving" and len(jobs_of(w, "fetch")) == 1
+    assert logic.config_hash(logic.with_defaults(spec(V1, cache_vol=True, cache="Cold"))) == \
+        logic.config_hash(logic.with_defaults(spec(V1, cache_vol=True)))
+    w = World()
+    w.run(spec(V1, cache_vol=True, cache="Cold"), serving(V1))
+    w.run(spec(V2, cache_vol=True, cache="Cold"), serving(V2))
+    assert not jobs_of(w, "cache-seed") and not jobs_of(w, "cache-publish")
+
+
+def test_controller_upgrade_on_a_serving_swap_only_publishes():
+    w = World(store=False)                                        # the controller before seeding existed
+    w.run(spec(V1, cache_vol=True), serving(V1))
+    before = dict(w.status)
+    w.store = True
+    acts, new = logic.decide("sw", spec(V1, cache_vol=True), before, w.view(), w.preflight, w.t, w.job_view(), True)
+    assert [(a[0], a[2], a[3]) for a in acts] == [("job", "cache-publish", {"slot": "lab-sw-f1"})]
+    assert new["phase"] == "Serving" and new["active"] == before["active"]
+    acts, _ = logic.decide("sw", spec(V1, cache_vol=True), new, w.view(), w.preflight, w.t, w.job_view(), True)
+    assert acts == []

@@ -24,6 +24,11 @@ graph's namespace-prefix discovery picks it up. Fulls always use host port set a
 --model from its set's link on each node (/data/hf/swap/<namespace>/<swap>-<set> -> a snapshot dir), which the
 controller points at the slot's version before it starts or reloads it, so a restarted worker comes back on the
 version its slot serves now.
+Compile caches (spec.cache: Seed, the default): the swap also seeds each node's compile cache (the hostPath of the
+graph's compile-cache volume) from the namespace's cache store, a shared volume, beside the download gate, and waits
+for that at most CACHE_TIMEOUT before it starts an engine; a slot that serves steadily publishes its nodes' new
+entries to the store. Both are best effort: a failure, a timeout or no store means the engines compile what they
+lack, as without seeding. spec.cache is not part of what a slot is, so changing it starts no swap.
 """
 from __future__ import annotations
 
@@ -52,6 +57,8 @@ SET_OF = {"full": "a", "bridge": "b"}
 LABEL_MAX = 63
 LINK_ROOT = "/data/hf/swap"
 HF_ROOT = "/data/hf"
+CACHE_VOLUME = "compile-cache"     # the graph's volume (a hostPath) mounted as the engines' compile cache
+CACHE_TIMEOUT = 300.0              # longest an engine start waits for seeding (main sets it from the chart)
 
 DEFAULTS = {
     "frontendGraph": "lab",
@@ -63,6 +70,7 @@ DEFAULTS = {
     "servedModelAliases": [],
     "revision": "",
     "reload": "Auto",
+    "cache": "Seed",
     "fetch": {"hfEndpoint": "https://serverlessgpu.aifoundry.scicom.dev/hf", "tokenSecret": "aif-hub-token",
               "timeoutSeconds": 3600},
 }
@@ -130,6 +138,8 @@ def validate(s: dict, swap: str) -> str:
                 f"(> {LABEL_MAX}); shorten the swap name or the component names")
     if s["reload"] not in ("Auto", "Bridge"):
         return f"spec.reload must be Auto or Bridge (got {s['reload']!r})"
+    if s["cache"] not in ("Seed", "Cold"):
+        return f"spec.cache must be Seed or Cold (got {s['cache']!r})"
     return ""
 
 
@@ -141,6 +151,17 @@ def _node_of(component: dict) -> str:
 def graph_nodes(s: dict) -> list[str]:
     """The nodes the slots run on: where the download gate and the model links must be."""
     return sorted({_node_of(c) for c in workers(s).values()})
+
+
+def cache_dir(s: dict, node: str) -> str:
+    """The node's compile cache: the hostPath of the graph's compile-cache volume on that node ("" when none)."""
+    for c in workers(s).values():
+        if _node_of(c) != node:
+            continue
+        for v in ((c.get("podTemplate") or {}).get("spec") or {}).get("volumes") or []:
+            if v.get("name") == CACHE_VOLUME and (v.get("hostPath") or {}).get("path"):
+                return v["hostPath"]["path"]
+    return ""
 
 
 def link_path(namespace: str, swap: str, kind: str) -> str:
@@ -339,10 +360,11 @@ def _wait(slot: dict, slots: dict, timeout: float, now: float, acts: list) -> st
 
 
 def decide(swap: str, spec: dict, status: dict, slots: dict, preflight, now: float | None = None,
-           jobs: dict | None = None):
+           jobs: dict | None = None, cache_store: bool = True):
     """One step. slots: {slot: {state, listed, acked, retired, prefill}} for every slot seen in the cluster (retired: its
     prefill is scaled to 0; prefill: "missing" once no prefill pod is left). preflight(pct) -> (ok, why). jobs: {key:
-    {state: running|succeeded|failed, result, error}} for the node Jobs main ran, all nodes merged.
+    {state: running|succeeded|failed, result, error}} for the node Jobs main ran, all nodes merged. cache_store: main
+    has a cache store to seed from and publish to.
     Returns (actions, new_status); actions are ("create", kind, slot) / ("retire", slot) / ("delete", slot) /
     ("probe", slot, model) / ("job", key, mode, params) / ("reload", slot, params). main writes a reload's outcome to
     status["reload"] before the next step."""
@@ -363,11 +385,14 @@ def decide(swap: str, spec: dict, status: dict, slots: dict, preflight, now: flo
     active, bridge, nxt, old = st.get("active"), st.get("bridge"), st.get("next"), st.get("old")
     gen = int(st.get("gen") or 0)
     nodes = graph_nodes(s)
+    use_cache = cache_store and s["cache"] == "Seed" and all(cache_dir(s, n) for n in nodes)
 
     def state(name):
         return (slots.get(name) or {}).get("state", "missing")
 
     def create(kind, slot_obj, pct):
+        if not seeded():
+            return False
         ok, why = preflight(pct)
         if not ok:
             st["message"] = why
@@ -407,6 +432,42 @@ def decide(swap: str, spec: dict, status: dict, slots: dict, preflight, now: flo
         st["seq"] = int(st.get("seq") or 0) + 1
         return st["seq"]
 
+    def start_seed():
+        st["seed"] = {"hash": want, "nodes": nodes, "key": f"seed-{next_seq()}", "since": now}
+        acts.append(("job", st["seed"]["key"], "cache-seed", {}))
+
+    def seeded():
+        """Never a gate: True once this spec's seeding Jobs finished, failed or overran CACHE_TIMEOUT. The engines then
+        start with whatever their node caches hold, compiling the rest as they would without seeding."""
+        if not use_cache:
+            return True
+        sd = st.get("seed") or {}
+        if sd.get("hash") != want or sd.get("nodes") != nodes:
+            start_seed()
+            sd = st["seed"]
+        if sd.get("done"):
+            return True
+        j = jobs.get(sd["key"]) or {}
+        if j.get("state") == "succeeded":
+            sd["outcome"] = "seeded"
+        elif j.get("state") == "failed":
+            sd["outcome"] = f"failed, engines load without it: {j.get('error')}"[:300]
+        elif now - sd["since"] > CACHE_TIMEOUT:
+            sd["outcome"] = f"no result in {CACHE_TIMEOUT:.0f} s, engines load without it"
+        else:
+            st["message"] = (f"seeding compile caches on {', '.join(nodes)} from the cache store "
+                             f"(best effort, at most {CACHE_TIMEOUT:.0f} s)")
+            return False
+        sd.update(done=True, results=j.get("results"))
+        return True
+
+    def publish(slot):
+        """Once per slot, when it serves steadily: its nodes' new cache entries go to the store (not waited for)."""
+        if not use_cache or slot in (st.get("published") or []):
+            return
+        acts.append(("job", f"publish-{next_seq()}", "cache-publish", {"slot": slot}))
+        st["published"] = [*(st.get("published") or []), slot][-6:]
+
     def gate():
         """The download gate for the spec as it is now. (candidate, None) once the model is on every node, (None, None)
         while the Jobs run, (None, error) when they failed."""
@@ -417,6 +478,9 @@ def decide(swap: str, spec: dict, status: dict, slots: dict, preflight, now: flo
         if f.get("hash") != want or f.get("nodes") != nodes:
             f = {"hash": want, "model": model_ref(s), "nodes": nodes, "key": f"fetch-{next_seq()}", "since": now}
             st["fetching"] = f
+            sd = st.get("seed") or {}
+            if use_cache and (sd.get("hash"), sd.get("nodes")) != (want, nodes):
+                start_seed()                     # beside the gate, so the first engine rarely waits for it
         j = jobs.get(f["key"]) or {}
         if j.get("state") == "succeeded":
             r = j.get("result") or {}
@@ -483,6 +547,7 @@ def decide(swap: str, spec: dict, status: dict, slots: dict, preflight, now: flo
         else:
             if want == active["hash"]:
                 st["message"] = f"serving {active['model']} from {active['slot']}"
+            publish(active["slot"])
             return acts, _finish(st, slots)
 
     if phase == "Degraded" and nxt is None:     # serving on the bridge only: retry once the spec changes
@@ -557,6 +622,7 @@ def decide(swap: str, spec: dict, status: dict, slots: dict, preflight, now: flo
         r = _wait(bridge, slots, timeout, now, acts)
         if r == "acked":
             remove(active["slot"])
+            publish(bridge["slot"])
             st.update(phase="DrainingOld", old=active, active=None,
                       message=f"frontend routes to {bridge['slot']}; retiring {active['slot']}, prefill first")
         elif r in ("timeout", "failed"):

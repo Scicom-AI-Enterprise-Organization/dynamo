@@ -37,3 +37,8 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version }}
 {{- define "model-swap.code" -}}
 {{ (.Files.Glob "controller/*.py").AsConfig }}
 {{- end -}}
+
+{{/* The cache store claim the seed and publish Jobs mount. */}}
+{{- define "model-swap.cacheStoreClaim" -}}
+{{- default (printf "%s-cache-store" (include "model-swap.fullname" .)) .Values.cacheStore.existingClaim -}}
+{{- end -}}

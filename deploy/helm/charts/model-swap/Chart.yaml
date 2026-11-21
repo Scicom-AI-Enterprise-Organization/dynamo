@@ -7,15 +7,17 @@ description: |
   rolled back on any failure). Otherwise it brings the new model up at a low --gpu-memory-utilization beside the
   old one on the same GPUs, removes the old one once the Dynamo frontend routes to the new copy, brings the new
   model up at full size, then removes the small copy. Callers keep one --served-model-name throughout.
+  With a cache store, each node's compile cache is seeded before a slot starts, so an engine returning to a
+  node it was lent from starts warm (best effort; a failure means a normal cold load).
 
   Each step is its own workers-only DynamoGraphDeployment owned by the DynamoModelSwap. A frontend-only graph in
   the same namespace finds them through Dynamo's namespace-prefix discovery. Needs the Dynamo operator (any
   release with v1beta1 DynamoGraphDeployments) and HAMi for GPU pinning and sharing. Scicom add-on; not in
   upstream ai-dynamo/dynamo.
 type: application
-version: 0.2.0
+version: 0.3.0
 # appVersion tracks the controller code in controller/ (shipped in a ConfigMap, run on a stock python image).
-appVersion: "0.2.0"
+appVersion: "0.3.0"
 keywords:
   - dynamo
   - vllm
