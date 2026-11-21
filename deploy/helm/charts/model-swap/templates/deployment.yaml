@@ -22,6 +22,10 @@ spec:
         checksum/code: {{ include "model-swap.code" . | sha256sum }}
     spec:
       serviceAccountName: {{ include "model-swap.fullname" . }}
+      {{- if .Values.hostNetwork }}
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- end }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -63,9 +67,13 @@ spec:
               value: /deps:/app
             - name: WATCH_NAMESPACE
               value: {{ include "model-swap.watchNamespace" . | quote }}
+            - name: HEALTH_PORT
+              value: {{ .Values.healthPort | quote }}
+            - name: PAUSE_CAP_SECONDS
+              value: {{ .Values.pauseCapSeconds | quote }}
           ports:
             - name: health
-              containerPort: 8080
+              containerPort: {{ .Values.healthPort }}
           # 200 while the loop has listed DynamoModelSwaps in the last 180 s.
           livenessProbe:
             httpGet: {path: /, port: health}

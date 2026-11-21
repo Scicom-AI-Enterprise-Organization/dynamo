@@ -1,5 +1,5 @@
 # Not part of the release: tests, examples and build helpers. .Files cannot read these, so the code ConfigMap
-# holds only controller/main.py and controller/logic.py.
+# holds only controller/main.py, logic.py and fetch.py.
 controller/test_*.py
 __pycache__/
 *.pyc

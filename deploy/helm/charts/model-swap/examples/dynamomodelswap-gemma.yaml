@@ -1,16 +1,17 @@
 # Example DynamoModelSwap: the one manifest to edit, as run in the B300 reload lab (node-2, namespace reload-lab,
-# Gemma-4-31B NVFP4, prefill TP4 on cards 0-3 + decode TP4 on cards 4-7). Change spec.model and the controller:
+# Gemma-4-31B NVFP4, prefill TP4 on cards 0-3 + decode TP4 on cards 4-7). Change spec.model (or pin spec.revision)
+# and the controller runs the swap: the download gate on every node of the graph, then an in-place reload when only
+# the weights change (versionAlias must be false), else the 0.27 bridge:
 #   1. bridge: the new model at util 0.27 (HAMi gpumem 27) beside the old at 0.70, on the same 8 cards
 #   2. once the frontend routes requests to the bridge, the old 0.70 pair is removed, prefill first (60 s drain)
 #   3. once the old pods are gone, the new model at 0.70
 #   4. once the frontend routes to it, the bridge is removed the same way
-# Callers always send spec.servedModelName; with versionAlias, spec.model is also an alias, so a request can pin a
-# version during a swap. Watch: kubectl get dms gemma -w. History: .status.history.
-# spec.graph is a DynamoGraphDeployment spec (one prefill + one decode); the controller sets --model,
-# --served-model-name, --gpu-memory-utilization, the host ports and nvidia.com/gpumem-percentage on each slot.
+# Callers always send spec.servedModelName. Watch: kubectl get dms gemma -w. History: .status.history.
+# spec.graph is a DynamoGraphDeployment spec (one prefill + one decode); the controller sets --model (the slot's
+# link), --served-model-name, --gpu-memory-utilization, the host ports and nvidia.com/gpumem-percentage on each slot.
 # Cluster-specific, change for another cluster: the GPU UUIDs (nvidia.com/use-gpuuuid), the node name, the image
-# and regcred, the RDMA resource and UCX devices, and /data/hf, where the weights must already be
-# (HF_HUB_OFFLINE=1). The ArgoCD annotation only matters when ArgoCD syncs it in the same app as the CRD.
+# and regcred, the RDMA resource and UCX devices, and /data/hf. The ArgoCD annotation only matters when ArgoCD syncs
+# it in the same app as the CRD.
 apiVersion: dynamoswap.scicom.dev/v1alpha1
 kind: DynamoModelSwap
 metadata:
@@ -18,9 +19,9 @@ metadata:
   annotations:
     argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
 spec:
-  model: Scicom-intl/gemma-4-31B-it-dpo-repetition-v3.3-handover-v15-2026-10-24-NVFP4-FP8-attn
+  model: Scicom-intl/gemma-4-31B-it-dpo-repetition-v3.3-handover-v20a-2026-10-27-NVFP4-FP8-attn
   servedModelName: gemma-4-31b-dpo
-  versionAlias: true
+  versionAlias: false
   frontendGraph: lab
   steady:
     gpuMemoryUtilization: 0.70
@@ -58,6 +59,12 @@ spec:
                 hostPath:
                   path: /data/hf
                   type: Directory
+              # Compile caches kept on the node (torch.compile, FlashInfer JIT kernels and autotune results,
+              # Triton), so a later engine of the same model and config skips that work. Lab test, 2026-11-21.
+              - name: compile-cache
+                hostPath:
+                  path: /data/vllm-cache/reload-lab
+                  type: DirectoryOrCreate
             containers:
               - name: main
                 image: 865626945255.dkr.ecr.ap-southeast-5.amazonaws.com/scicom/dynamo-vllm-runtime:v1.6.0-nightly-20261016-gemma4-hetero-tp.1-cu130
@@ -137,6 +144,8 @@ spec:
                     value: "0"
                   - name: PYTHONHASHSEED
                     value: "0"
+                  - name: TORCHINDUCTOR_CACHE_DIR
+                    value: /root/.cache/vllm/inductor
                   - name: NCCL_NET_PLUGIN
                     value: none
                   - name: UCX_TLS
@@ -164,6 +173,15 @@ spec:
                   - name: hf-cache
                     mountPath: /data/hf
                     readOnly: true
+                  - name: compile-cache
+                    mountPath: /root/.cache/vllm
+                    subPath: vllm
+                  - name: compile-cache
+                    mountPath: /root/.cache/flashinfer
+                    subPath: flashinfer
+                  - name: compile-cache
+                    mountPath: /root/.triton
+                    subPath: triton
       - name: VllmDecodeWorker
         type: decode
         runtimeVersionOverride: "1.5.0"
@@ -190,6 +208,12 @@ spec:
                 hostPath:
                   path: /data/hf
                   type: Directory
+              # Compile caches kept on the node (torch.compile, FlashInfer JIT kernels and autotune results,
+              # Triton), so a later engine of the same model and config skips that work. Lab test, 2026-11-21.
+              - name: compile-cache
+                hostPath:
+                  path: /data/vllm-cache/reload-lab
+                  type: DirectoryOrCreate
             containers:
               - name: main
                 image: 865626945255.dkr.ecr.ap-southeast-5.amazonaws.com/scicom/dynamo-vllm-runtime:v1.6.0-nightly-20261016-gemma4-hetero-tp.1-cu130
@@ -267,6 +291,8 @@ spec:
                     value: "0"
                   - name: PYTHONHASHSEED
                     value: "0"
+                  - name: TORCHINDUCTOR_CACHE_DIR
+                    value: /root/.cache/vllm/inductor
                   - name: NCCL_NET_PLUGIN
                     value: none
                   - name: UCX_TLS
@@ -294,3 +320,12 @@ spec:
                   - name: hf-cache
                     mountPath: /data/hf
                     readOnly: true
+                  - name: compile-cache
+                    mountPath: /root/.cache/vllm
+                    subPath: vllm
+                  - name: compile-cache
+                    mountPath: /root/.cache/flashinfer
+                    subPath: flashinfer
+                  - name: compile-cache
+                    mountPath: /root/.triton
+                    subPath: triton

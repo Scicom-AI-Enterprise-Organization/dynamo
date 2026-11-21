@@ -27,6 +27,15 @@ fullnameOverride: ""
 nodeSelector: {}
 tolerations: []
 
+# hostNetwork: an in-place reload calls the workers' /engine/ admin routes on their system ports. On clusters that
+# firewall those routes to a node's own host network (B300's admin-port-guard), the controller must run there too.
+hostNetwork: true
+# The liveness endpoint. With hostNetwork it is a host port: pick one that is free on the node.
+healthPort: 18080
+# Longest wait for running requests to finish when an in-place reload pauses an engine (wait mode). Past it the
+# reload is abandoned (the engine resumes on its old weights) and the swap goes through the bridge.
+pauseCapSeconds: 60
+
 resources:
   requests:
     cpu: 50m
