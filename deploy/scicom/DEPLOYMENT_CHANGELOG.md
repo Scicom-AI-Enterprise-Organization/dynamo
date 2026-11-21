@@ -11,15 +11,6 @@ so keep `TIME_DEPLOYMENT` in the sbatch in step with the `.so` you actually buil
 
 ---
 
-## Branch `feat/dynamo-model-swap` (off `1.6.0-scicom-gemma4-toolturn-reasoning`)
-
-Adds `deploy/helm/charts/model-swap`: the `DynamoModelSwap` CRD and its controller, which change the model of a
-one-replica prefill + decode graph with no downtime from one edit of `spec.model` (a 0.27 bridge copy of the new
-model beside the old 0.70, then the new 0.70). Deployment-only: no change to the runtime, the frontend or the operator,
-so the images and the `.so` stay as below. The same controller code ran the B300 node-2 reload lab on 2026-11-21 from
-b300-bangkok (`argocd/apps/reload-lab`, branch `exp/zero-downtime-reload`, commit `2839b82`): 0 of 15,381 requests
-failed during a swap under load. Not yet deployed from this chart. See the chart's `README.md`.
-
 ## Branch `1.6.0-scicom-gemma4-toolturn-reasoning`
 
 The same fixes on upstream `main` at `f95c85b41` (2026-10-16, the commit behind the
@@ -41,6 +32,17 @@ Each commit is a `cherry-pick -x` of its 1.5.0 commit, including the two of
 | `c21fa44d9`, `85aff69ec` (`feat/prom-metrics-for-bucketing`) | `a98672d367`, `067bd86e1c` | Ported. Upstream renamed the histogram bucket variables to `DYN_METRICS_*` and kept `DYN_HISTOGRAM_*` as a deprecated fallback; `DYN_METRICS_ISL_BUCKETS` sits next to them. |
 | (new) | `7a2e5fa3fd` | Upstream 1.6 has a second gemma4 gate, in the unified (v2) parser path, that still turned reasoning off unless `enable_thinking=true`. `DYN_PARSER_VERSION=auto` sends gemma4 down the legacy path, so the leak only came back with `DYN_PARSER_VERSION=2`; this keeps the parser on there too and updates upstream's two raw-batch tests. The SGLang gate is left as upstream has it. |
 | (new) | `fa968622af` | Test-only: restores a closing brace lost while keeping both sets of tests at the end of `postprocessor_parsing_stream.rs`. |
+| (new) | `fcabb499e4`, merged by `f3af890c8b` (2026-11-21) | `deploy/helm/charts/model-swap`, from `feat/dynamo-model-swap`; see below. Deployment-only. |
+
+### Model swap with no downtime: `deploy/helm/charts/model-swap` (2026-11-21)
+
+Merged from `feat/dynamo-model-swap`. The `DynamoModelSwap` CRD and its controller change the model of a one-replica
+prefill + decode graph with no downtime from one edit of `spec.model`: a 0.27 bridge copy of the new model beside the
+old 0.70, the old removed once the frontend routes to the bridge, then the new 0.70. Deployment-only: no change to the
+runtime, the frontend, the operator or the vLLM patch, so the release tag `v1.6.0-nightly-20261016-gemma4-hetero-tp.1`
+and its images stay at `197b12e`, and nothing needs a rebuild. The same controller code ran the B300 node-2 reload lab
+on 2026-11-21 from b300-bangkok (`argocd/apps/reload-lab`, branch `exp/zero-downtime-reload`, commit `2839b82`): 0 of
+15,381 requests failed during a swap under load. Nothing is deployed from this chart yet. See the chart's `README.md`.
 
 ### Prefill and decode with different TP (gemma-4)
 
