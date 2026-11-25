@@ -71,6 +71,8 @@ spec:
               value: {{ .Values.healthPort | quote }}
             - name: PAUSE_CAP_SECONDS
               value: {{ .Values.pauseCapSeconds | quote }}
+            - name: EXTRA_PREFILL_JSON
+              value: {{ .Values.extraPrefill | toJson | quote }}
             {{- if .Values.cacheStore.enabled }}
             - name: CACHE_STORE_PVC
               value: {{ include "model-swap.cacheStoreClaim" . | quote }}

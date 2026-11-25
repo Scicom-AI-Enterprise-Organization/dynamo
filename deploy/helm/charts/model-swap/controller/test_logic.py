@@ -37,6 +37,7 @@ class World:
         self.seed, self.store = seed, store             # seed: ok | fail | hang (what the cache-seed Jobs do)
         self.fetch_fail, self.reload_fail, self.compatible = set(fetch_fail), set(reload_fail), compatible
         self.slots, self.jobs, self.links, self.t, self.log, self.status = {}, {}, {}, 0, [], {}
+        self.extras, self.last_reload, self.extra_busy = {}, None, ""
 
     def view(self):
         out = {}
@@ -44,15 +45,19 @@ class World:
             ret = x["ret"] is not None
             prefill = "missing" if ret and self.t - x["ret"] >= self.exit else "present"
             if x["del"] is not None:
-                out[n] = {"state": "terminating", "listed": False, "acked": False, "retired": ret, "prefill": prefill}
+                out[n] = {"state": "terminating", "listed": False, "acked": False, "retired": ret, "prefill": prefill,
+                          "hash": x["hash"]}
             elif n in self.fail and self.t - x["born"] >= self.load:
-                out[n] = {"state": "failed", "listed": False, "acked": False, "retired": ret, "prefill": prefill}
+                out[n] = {"state": "failed", "listed": False, "acked": False, "retired": ret, "prefill": prefill,
+                          "hash": x["hash"]}
             elif ret:   # prefill unregistered at once: the frontend stops routing to the slot
-                out[n] = {"state": "pending", "listed": False, "acked": False, "retired": True, "prefill": prefill}
+                out[n] = {"state": "pending", "listed": False, "acked": False, "retired": True, "prefill": prefill,
+                          "hash": x["hash"]}
             else:
                 age = self.t - x["born"]
                 out[n] = {"state": "ready" if age >= self.load else "pending", "listed": age >= self.load,
-                          "acked": age >= self.load + self.ack, "retired": False, "prefill": "present"}
+                          "acked": age >= self.load + self.ack, "retired": False, "prefill": "present",
+                          "hash": x["hash"]}
         return out
 
     def job_view(self):
@@ -78,12 +83,16 @@ class World:
         used = sum(x["pct"] for x in self.slots.values())
         return (used + pct <= 100), f"{used}+{pct}"
 
+    def preflight_extra(self, pct):
+        return (not self.extra_busy), self.extra_busy or "free"
+
     def step(self, sp, now=None):
         if isinstance(sp, str):
             sp = spec(sp)
         before = json.dumps(self.status, sort_keys=True)
         acts, new = logic.decide("sw", sp, self.status, self.view(), self.preflight,
-                                 now if now is not None else self.t, self.job_view(), self.store)
+                                 now if now is not None else self.t, self.job_view(), self.store,
+                                 self.extras, self.preflight_extra)
         assert json.dumps(self.status, sort_keys=True) == before, "decide() changed the status it was given"
         self.status = json.loads(json.dumps(new))      # as the CR stores it
         s = logic.with_defaults(sp)
@@ -94,8 +103,16 @@ class World:
                 assert link == snap(logic.model_ref(s)) or a[1] == "full" and self.status.get("next", {}).get("retiring"), \
                     f"{a[2]} created while its link points at {link}"
                 self.slots[a[2]] = {"born": self.t, "del": None, "ret": None, "pct": pct, "kind": a[1],
-                                    "model": logic.model_ref(s)}
+                                    "model": logic.model_ref(s), "hash": f"{len(self.slots) + 1:08x}"}
                 self.log.append(("+", a[2], logic.model_ref(s)))
+            elif a[0] == "extra-create":
+                assert self.links["a"] == snap(logic.model_ref(s)), f"extra {a[1]} created before the slot's link moved"
+                assert a[3] == self.view()[a[2]]["hash"], "extra prefill joined with the wrong worker hash"
+                self.extras[a[1]] = {"slot": a[2], "hash": a[3]}
+                self.log.append(("+extra", a[1], a[2]))
+            elif a[0] == "extra-delete" and a[1] in self.extras:
+                del self.extras[a[1]]
+                self.log.append(("-extra", a[1]))
             elif a[0] == "retire" and a[1] in self.slots and self.slots[a[1]]["ret"] is None:
                 self.slots[a[1]]["ret"] = self.t
                 self.log.append(("r", a[1]))
@@ -110,6 +127,7 @@ class World:
             elif a[0] == "reload":
                 p = a[2]
                 assert self.links["a"] == p["to"], "reloaded before the slot's link moved"
+                self.last_reload = dict(p)
                 ok = p["to"] not in {snap(m) for m in self.reload_fail}
                 self.status["reload"] = {"hash": p["hash"], "ok": ok, "why": "" if ok else "boom", "pausedSeconds": 3}
                 self.log.append(("reload", a[1], p["to"], ok))
@@ -288,7 +306,8 @@ def test_slot_timeout_counts_as_failure():
     w = World(load=10_000, job=0)
     w.status = {"phase": "Loading", "gen": 1, "links": {}, "next": {**logic._slot(
         logic.with_defaults(spec(V1)), "sw", "full", 1, 0, snap(V1))}}
-    w.slots["lab-sw-f1"] = {"born": 0, "del": None, "ret": None, "pct": 70, "kind": "full", "model": V1}
+    w.slots["lab-sw-f1"] = {"born": 0, "del": None, "ret": None, "pct": 70, "kind": "full", "model": V1,
+                            "hash": "deadbeef"}
     w.step(V1, now=1801)
     assert ("-", "lab-sw-f1") in w.log
 
@@ -386,3 +405,78 @@ def test_controller_upgrade_on_a_serving_swap_only_publishes():
     assert new["phase"] == "Serving" and new["active"] == before["active"]
     acts, _ = logic.decide("sw", spec(V1, cache_vol=True), new, w.view(), w.preflight, w.t, w.job_view(), True)
     assert acts == []
+
+
+# ---------------------------------------------------------------- extra prefill (a second prefill on its own node)
+
+def extra_spec(model, **kw):
+    return spec(model, extraPrefill={"enabled": True, "nodeSelector": {"kubernetes.io/hostname": "node-3"},
+                                     "gpuUUIDs": "GPU-c"}, **kw)
+
+
+def test_extra_prefill_follows_the_serving_slot_and_is_deleted_with_it():
+    w = World()
+    w.run(extra_spec(V1), serving(V1))
+    assert list(w.extras) == ["sw-prefill2-f1"] and w.extras["sw-prefill2-f1"]["slot"] == "lab-sw-f1"
+    w.log.clear()
+    w.run(extra_spec(V2), serving(V2))
+    # One at a time: the old extra goes when its slot is retired, the new one comes with the new full slot.
+    assert [e for e in w.log if e[0] in ("+extra", "-extra")] == [("-extra", "sw-prefill2-f1"),
+                                                                  ("+extra", "sw-prefill2-f2", "lab-sw-f2")]
+    assert list(w.extras) == ["sw-prefill2-f2"] and w.extras["sw-prefill2-f2"]["slot"] == "lab-sw-f2"
+    assert list(w.slots) == ["lab-sw-f2"]
+
+
+def test_extra_prefill_waits_for_the_slot_hash_and_for_its_cards():
+    sp = extra_spec(V1)
+    active = {"slot": "lab-sw-f1", "kind": "full", "model": V1, "snapshot": snap(V1),
+              "hash": logic.config_hash(logic.with_defaults(sp))}
+    st = {"phase": "Serving", "active": active}
+    acts, new = logic.decide("sw", sp, st, {"lab-sw-f1": {"state": "pending", "hash": ""}}, lambda p: (True, ""))
+    assert not [a for a in acts if a[0] == "extra-create"] and "hash" in new["extra"]["state"]
+    acts, new = logic.decide("sw", sp, st, {"lab-sw-f1": {"state": "ready", "hash": "deadbeef"}}, lambda p: (True, ""),
+                             preflight_extra=lambda p: (False, "busy"))
+    assert not [a for a in acts if a[0] == "extra-create"] and new["extra"]["state"].startswith("waiting")
+    acts, new = logic.decide("sw", sp, st, {"lab-sw-f1": {"state": "ready", "hash": "deadbeef"}}, lambda p: (True, ""))
+    assert [a for a in acts if a[0] == "extra-create"] == [("extra-create", "sw-prefill2-f1", "lab-sw-f1", "deadbeef")]
+
+
+def test_extra_prefill_renders_the_slot_namespace_link_and_placement():
+    s = logic.with_defaults(extra_spec(V2))
+    body = logic.render_extra_prefill("sw", "ns", s, "lab-sw-f2", "deadbeef")
+    comp = body["spec"]["components"][0]
+    c = comp["podTemplate"]["spec"]["containers"][0]
+    env = {e["name"]: e.get("value") for e in c["env"]}
+    assert body["metadata"]["name"] == "sw-prefill2-f2" and body["metadata"]["labels"][logic.L_EXTRA] == "sw"
+    assert env["DYN_NAMESPACE"] == "ns-lab-sw-f2" and env["DYN_NAMESPACE_WORKER_SUFFIX"] == "deadbeef"
+    assert comp["podTemplate"]["spec"]["nodeSelector"] == {"kubernetes.io/hostname": "node-3"}
+    assert comp["podTemplate"]["metadata"]["annotations"][logic.A_GPUS] == "GPU-c"
+    assert c["args"] == ["--model", "/data/hf/swap/ns/sw-a", "--served-model-name", "served", V2,
+                         "--gpu-memory-utilization", "0.70", "--block-size", "64"]
+    assert c["resources"]["limits"][logic.R_GPUMEM] == "70"
+    assert logic.graph_nodes(s) == ["node-2", "node-3"]      # the gate and the links run on its node too
+    assert logic.validate(s, "sw") == ""
+
+
+def test_extra_prefill_must_not_share_the_slot_node_or_leave_its_cards_unpinned():
+    bad = spec(V1, extraPrefill={"enabled": True, "nodeSelector": {"kubernetes.io/hostname": "node-2"},
+                                 "gpuUUIDs": "GPU-c"})
+    assert "already has a worker" in logic.validate(logic.with_defaults(bad), "sw")
+    no_gpus = spec(V1, extraPrefill={"enabled": True, "nodeSelector": {"kubernetes.io/hostname": "node-3"}})
+    assert "gpuUUIDs" in logic.validate(logic.with_defaults(no_gpus), "sw")
+
+
+def test_inplace_reload_loads_the_extra_prefill_too():
+    w = World()
+    w.run(extra_spec(V1, alias=False), serving(V1))
+    w.run(extra_spec(V2, alias=False), serving(V2))
+    assert w.last_reload and w.last_reload["extra"] == "sw-prefill2-f1"
+    assert list(w.extras) == ["sw-prefill2-f1"]              # same slot: the extra was reloaded, not replaced
+
+
+def test_disabling_the_extra_prefill_deletes_it():
+    w = World()
+    w.run(extra_spec(V1), serving(V1))
+    assert list(w.extras) == ["sw-prefill2-f1"]
+    w.run(spec(V1), serving(V1))
+    assert w.extras == {} and w.status["extra"] == {"enabled": False, "name": None}

@@ -45,6 +45,9 @@ KIND = "DynamoModelSwap"
 L_SWAP = f"{GROUP}/swap"
 L_SLOT = f"{GROUP}/slot"
 L_KIND = f"{GROUP}/kind"
+# Marks an extra prefill's own DGD. Not L_SWAP: that label selects the slots, and an extra prefill is not a slot (it has
+# no decode and must never be retired or deleted as one).
+L_EXTRA = f"{GROUP}/extra"
 A_GPUS = "nvidia.com/use-gpuuuid"
 R_GPUMEM = "nvidia.com/gpumem-percentage"
 
@@ -71,6 +74,7 @@ DEFAULTS = {
     "revision": "",
     "reload": "Auto",
     "cache": "Seed",
+    "extraPrefill": {"enabled": False},
     "fetch": {"hfEndpoint": "https://serverlessgpu.aifoundry.scicom.dev/hf", "tokenSecret": "aif-hub-token",
               "timeoutSeconds": 3600},
 }
@@ -136,6 +140,18 @@ def validate(s: dict, swap: str) -> str:
     if label > LABEL_MAX:
         return (f"names too long: {slot_name(s, swap, 'bridge', 999)}-<component>-<hash> is {label} characters "
                 f"(> {LABEL_MAX}); shorten the swap name or the component names")
+    if extra_config(s):
+        if not extra_node(s):
+            return "extraPrefill.nodeSelector kubernetes.io/hostname is required; pin the extra prefill's node"
+        if not extra_gpus(s):
+            return f"extraPrefill.gpuUUIDs is required; pin the extra prefill's cards ({A_GPUS})"
+        if extra_node(s) in {_node_of(c) for c in comps}:
+            return (f"extraPrefill runs on {extra_node(s)}, where the slot already has a worker: give it its own node, "
+                    f"or its engine would have to share that worker's cards")
+        label = len(extra_prefill_name(swap, slot_name(s, swap, "full", 999))) + 1 + len(workers(s)["prefill"]["name"]) + 1 + 8
+        if label > LABEL_MAX:
+            return (f"names too long: {extra_prefill_name(swap, slot_name(s, swap, 'full', 999))}-<component>-<hash> is "
+                    f"{label} characters (> {LABEL_MAX}); shorten the swap name")
     if s["reload"] not in ("Auto", "Bridge"):
         return f"spec.reload must be Auto or Bridge (got {s['reload']!r})"
     if s["cache"] not in ("Seed", "Cold"):
@@ -149,13 +165,19 @@ def _node_of(component: dict) -> str:
 
 
 def graph_nodes(s: dict) -> list[str]:
-    """The nodes the slots run on: where the download gate and the model links must be."""
-    return sorted({_node_of(c) for c in workers(s).values()})
+    """The nodes the slot runs on, including the extra prefill's: where the download gate and the model links must be."""
+    nodes = {_node_of(c) for c in workers(s).values()}
+    if extra_config(s) and extra_node(s):
+        nodes.add(extra_node(s))
+    return sorted(nodes)
 
 
 def cache_dir(s: dict, node: str) -> str:
     """The node's compile cache: the hostPath of the graph's compile-cache volume on that node ("" when none)."""
-    for c in workers(s).values():
+    comps = list(workers(s).values())
+    if extra_config(s):
+        comps.append(extra_component(s))
+    for c in comps:
         if _node_of(c) != node:
             continue
         for v in ((c.get("podTemplate") or {}).get("spec") or {}).get("volumes") or []:
@@ -190,6 +212,40 @@ def _gpus_of(component: dict) -> list[str]:
 
 def graph_gpus(s: dict) -> list[str]:
     return sorted({g for c in workers(s).values() for g in _gpus_of(c)})
+
+
+def extra_config(s: dict) -> dict | None:
+    """spec.extraPrefill when a second prefill worker is configured (chart values, not the CR: it starts no swap)."""
+    e = s.get("extraPrefill") or {}
+    return e if e.get("enabled") else None
+
+
+def extra_node(s: dict) -> str:
+    return ((extra_config(s) or {}).get("nodeSelector") or {}).get("kubernetes.io/hostname") or ""
+
+
+def extra_gpus(s: dict) -> list[str]:
+    raw = (extra_config(s) or {}).get("gpuUUIDs") or ""
+    return [g.strip() for g in raw.split(",") if g.strip()]
+
+
+def extra_component(s: dict) -> dict:
+    """The graph's prefill worker on the extra prefill's node and cards: the engine spec stays one (same image, args and
+    env, so its ModelDeploymentCard matches the slot's prefill and discovery admits it), only its placement changes."""
+    if not extra_config(s):
+        return {}
+    comp = copy.deepcopy(workers(s).get("prefill") or {})
+    pt = comp.setdefault("podTemplate", {})
+    pt.setdefault("spec", {})["nodeSelector"] = {"kubernetes.io/hostname": extra_node(s)}
+    md = pt.setdefault("metadata", {})
+    md["annotations"] = {**(md.get("annotations") or {}), A_GPUS: ",".join(extra_gpus(s))}
+    return comp
+
+
+def extra_prefill_name(swap: str, slot: str) -> str:
+    """The extra prefill's DGD for a slot: the swap and the slot's generation (f13), short enough for the operator's
+    pod label <dgd>-<component>-<hash> (a full slot name would not be)."""
+    return f"{swap}-prefill2-{slot.rsplit('-', 1)[-1]}"
 
 
 # ---------------------------------------------------------------- rendering a slot
@@ -261,6 +317,54 @@ def render_slot(swap: str, namespace: str, s: dict, slot: str, kind: str) -> dic
                      "labels": {L_SWAP: swap, L_SLOT: slot, L_KIND: kind},
                      "annotations": {f"{GROUP}/model": model_ref(s)}},
         "spec": graph,
+    }
+
+
+def render_extra_prefill(swap: str, namespace: str, s: dict, slot: str, worker_hash: str) -> dict:
+    """The second prefill's own DGD: the graph's prefill on the extra node, registered in the slot's runtime namespace
+    so the frontend's prefill router for that worker set uses it. It is not a component of the slot: the operator's
+    worker hash covers every worker component of a DGD, so adding one there would roll the slot's prefill and decode."""
+    comp = extra_component(s)
+    names = list(dict.fromkeys([s["servedModelName"], *(s.get("servedModelAliases") or []),
+                                *([s["model"]] if s.get("versionAlias") else [])]))
+    util = s["steady"]
+    i = PORT_INDEX[("a", "prefill")]
+    ports = {"system": 9090 + i, "nixl": 19090 + i, "fpm": 20380 + 10 * i, "side": 5600 + 100 * i, "kv": 20080}
+    pt = comp.setdefault("podTemplate", {})
+    containers = pt.setdefault("spec", {}).setdefault("containers", [{}])
+    c = next((x for x in containers if x.get("name") == "main"), containers[0])
+    args = strip_args([str(a) for a in c.get("args") or []])
+    for j, a in enumerate(args[:-1]):
+        if a == "--kv-events-config":
+            cfg = json.loads(args[j + 1])
+            cfg["endpoint"] = f"tcp://*:{ports['kv']}"
+            args[j + 1] = json.dumps(cfg, separators=(",", ":"))
+    c["args"] = ["--model", link_path(namespace, swap, "full"), "--served-model-name", *names,
+                 "--gpu-memory-utilization", f"{float(util['gpuMemoryUtilization']):.2f}", *args]
+    for p in c.get("ports") or []:
+        if p.get("name") in ("system", "nixl"):
+            p["containerPort"] = ports[p["name"]]
+    _set_env(c, "DYN_SYSTEM_PORT", str(ports["system"]))
+    _set_env(c, "DYN_FORWARDPASS_METRIC_PORT", str(ports["fpm"]))
+    _set_env(c, "VLLM_NIXL_SIDE_CHANNEL_PORT", str(ports["side"]))
+    # The slot's runtime namespace. The operator derives it from the slot DGD's own name and worker hash, which this DGD
+    # does not share, and a component's env wins over the operator's.
+    _set_env(c, "DYN_NAMESPACE", f"{namespace}-{slot}")
+    _set_env(c, "DYN_NAMESPACE_WORKER_SUFFIX", worker_hash)
+    if any(e.get("name") == "MODEL" for e in c.get("env") or []):
+        _set_env(c, "MODEL", s["model"])
+    limits = c.setdefault("resources", {}).setdefault("limits", {})
+    limits[R_GPUMEM] = str(int(util["gpumemPercentage"]))
+    spec = copy.deepcopy(s["graph"])
+    spec.pop("services", None)
+    spec["components"] = [comp]
+    return {
+        "apiVersion": "nvidia.com/v1beta1",
+        "kind": "DynamoGraphDeployment",
+        "metadata": {"name": extra_prefill_name(swap, slot), "namespace": namespace,
+                     "labels": {L_EXTRA: swap, L_SLOT: slot},
+                     "annotations": {f"{GROUP}/model": model_ref(s), f"{GROUP}/slot": slot}},
+        "spec": spec,
     }
 
 
@@ -360,7 +464,52 @@ def _wait(slot: dict, slots: dict, timeout: float, now: float, acts: list) -> st
 
 
 def decide(swap: str, spec: dict, status: dict, slots: dict, preflight, now: float | None = None,
-           jobs: dict | None = None, cache_store: bool = True):
+           jobs: dict | None = None, cache_store: bool = True, extras: dict | None = None,
+           preflight_extra=None):
+    """One step, including the extra prefill that follows the serving full slot. extras: {name: {}} of the extra
+    prefill DGDs this swap already has; preflight_extra(pct) checks the extra prefill's cards (default: preflight).
+    Returns (actions, new_status); actions are (\"create\", kind, slot) / (\"retire\", slot) / (\"delete\", slot) /
+    (\"probe\", slot, model) / (\"job\", key, mode, params) / (\"reload\", slot, params) /
+    (\"extra-create\", name, slot, worker hash) / (\"extra-delete\", name)."""
+    acts, st = _decide(swap, spec, status, slots, preflight, now, jobs, cache_store)
+    s = with_defaults(spec)
+    if extra_config(s):
+        for a in acts:                       # an in-place reload must load the new weights into the extra prefill too
+            if a[0] == "reload" and extra_prefill_name(swap, a[1]) in (extras or {}):
+                a[2]["extra"] = extra_prefill_name(swap, a[1])
+    _reconcile_extra(swap, s, st, slots, acts, extras or {}, preflight_extra or preflight)
+    return acts, st
+
+
+def _reconcile_extra(swap: str, s: dict, st: dict, slots: dict, acts: list, extras: dict, preflight) -> None:
+    """Keep exactly one extra prefill: the one that follows the serving full slot. It is created once the slot's worker
+    hash is known (the frontend's prefill router is per runtime namespace) and its cards are free, and deleted when the
+    slot it followed is retiring or gone, so it never outlives its slot holding the node."""
+    target = next((x for x in (st.get("active"), st.get("next")) if x and x.get("kind") == "full"), None)
+    want = extra_prefill_name(swap, target["slot"]) if (extra_config(s) and target) else ""
+    st["extra"] = {"enabled": bool(extra_config(s)), "name": want or None}
+    for name in sorted(extras):
+        if name != want:
+            acts.append(("extra-delete", name))
+    if not want:
+        return
+    if want in extras:
+        st["extra"]["state"] = "present"
+        return
+    worker_hash = (slots.get(target["slot"]) or {}).get("hash") or ""
+    if not worker_hash:
+        st["extra"]["state"] = "waiting for the slot's worker hash"
+        return
+    ok, why = preflight(int(s["steady"]["gpumemPercentage"]))
+    if not ok:
+        st["extra"]["state"] = f"waiting: {why}"
+        return
+    acts.append(("extra-create", want, target["slot"], worker_hash))
+    st["extra"]["state"] = "creating"
+
+
+def _decide(swap: str, spec: dict, status: dict, slots: dict, preflight, now: float | None = None,
+            jobs: dict | None = None, cache_store: bool = True):
     """One step. slots: {slot: {state, listed, acked, retired, prefill}} for every slot seen in the cluster (retired: its
     prefill is scaled to 0; prefill: "missing" once no prefill pod is left). preflight(pct) -> (ok, why). jobs: {key:
     {state: running|succeeded|failed, result, error}} for the node Jobs main ran, all nodes merged. cache_store: main

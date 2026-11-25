@@ -38,11 +38,11 @@ The controller uses this path only when all of these hold:
 - `versionAlias` is `false`.
 
 It then reloads the running pair through the workers' `/engine/` routes:
-1. Pause the prefill, then the decode, in `wait` mode, so running requests finish and new ones queue. Each pause may
-   take at most `pauseCapSeconds` (60).
-2. Load the new weights into both with `update_weights_from_disk`.
-3. Resume the decode, then the prefill.
-4. Check: both workers report the new version, and a greedy "count from 1 to 20" through every frontend pod answers
+1. Pause the prefills (the slot's and, when configured, the extra prefill's), then the decode, in `wait` mode, so
+   running requests finish and new ones queue. Each pause may take at most `pauseCapSeconds` (60).
+2. Load the new weights into all of them with `update_weights_from_disk`.
+3. Resume the decode, then the prefills.
+4. Check: every worker reports the new version, and a greedy "count from 1 to 20" through every frontend pod answers
    1..5 in order.
 
 Any failure loads the old weights back, resumes, and falls back to the bridge. Slots load `--model` from a link per
@@ -96,6 +96,33 @@ kubectl get dms -w                                       # Phase, Serving, Messa
 kubectl get dms gemma -o jsonpath='{.status.history}'    # each step with its time
 kubectl logs deploy/model-swap -f                        # the release's full name
 ```
+
+## Extra prefill on another node (`extraPrefill`)
+
+A second prefill worker can follow the serving full slot on its own node and cards, so a graph whose prefill is the
+bottleneck gets two prefill engines per request path without a second decode:
+
+```yaml
+extraPrefill:
+  enabled: true
+  nodeSelector: {kubernetes.io/hostname: node-3}
+  gpuUUIDs: "GPU-...,GPU-..."          # its own cards, on a node the graph does not use
+```
+
+- **What it is.** A DGD of its own, `<swap>-prefill2-<f|b><n>`, carrying the graph's prefill component (same image,
+  args and env, so its ModelDeploymentCard matches the slot's prefill and Dynamo's discovery admits it to the same
+  worker set) on `nodeSelector` / `gpuUUIDs`. It joins the slot's runtime namespace by setting `DYN_NAMESPACE` and
+  `DYN_NAMESPACE_WORKER_SUFFIX` to the slot's, which the operator otherwise derives from the DGD's own name and hash,
+  and it loads `--model` from the same link as the slot.
+- **Why not a component of the slot.** The operator's worker hash covers every worker component of a DGD
+  (`ComputeDGDWorkersSpecHash`), so adding one there would roll the slot's prefill and decode.
+- **When it exists.** With the full slot: created once the slot's worker hash is known (its pods exist) and its cards
+  are free, deleted when the slot is retired, so it never outlives its slot holding the node. A bridge has none, and
+  the controller never edits an existing extra prefill's spec (a metadata-only adoption if the object predates it).
+- **In-place reloads** load the new weights into it too; if it is not ready, the reload falls back to the bridge, which
+  replaces the slot and with it the extra prefill.
+- The download gate and the model links run on its node as well (`graph_nodes`), so a swap checks the model there and
+  points the link before the extra prefill starts.
 
 ## Compile-cache seeding (`spec.cache`)
 
