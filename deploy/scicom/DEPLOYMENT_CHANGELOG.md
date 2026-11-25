@@ -35,6 +35,7 @@ Each commit is a `cherry-pick -x` of its 1.5.0 commit, including the two of
 | (new) | `fcabb499e4`, merged by `f3af890c8b` (2026-11-21) | `deploy/helm/charts/model-swap`, from `feat/dynamo-model-swap`; see below. Deployment-only. |
 | (new) | `62ee582315`, merged 2026-11-21 | model-swap 0.2.0: download gate and in-place reload; see below. Deployment-only. |
 | (new) | `932fe4b1d4`, merged by `a7d07a7256` (2026-11-21) | model-swap 0.3.0: compile-cache seeding; see below. Deployment-only. |
+| (new) | `e66cd8bbf`, merged by `c2627255` (2026-11-25) | model-swap 0.4.0: an extra prefill that follows the slot; see below. Deployment-only. |
 
 ### Model swap with no downtime: `deploy/helm/charts/model-swap` (2026-11-21)
 
@@ -64,6 +65,16 @@ copy, or no result within `cacheStore.timeoutSeconds` (default 300), the engines
 plan is never copied, because its key ignores `--gpu-memory-utilization`. `spec.cache` is not part of the swap hash.
 On B300 node-2 (b300-bangkok `exp/zero-downtime-reload`, `d3f84d0`), prod's TP8 decode on a seeded cache went from
 container start to registered in 4 min 19 s; a cold start takes 9-12 min. Still deployment-only.
+
+**0.4.0** (`e66cd8bbf`): an optional second prefill worker that follows the serving full slot (`extraPrefill` in the
+chart values: its node and cards). It is a DGD of its own, `<swap>-prefill2-<f|b><n>`, carrying the graph's prefill
+component and joining the slot's runtime namespace through `DYN_NAMESPACE` and `DYN_NAMESPACE_WORKER_SUFFIX`, so the
+frontend's prefill router for that worker set uses both engines. A component of the slot instead would change the
+slot's worker hash and roll its prefill and decode. It is created once the slot's worker hash is known and its cards
+are free, deleted when the slot is retired, and reloaded in place with the slot's engines, so it never serves stale
+weights and never outlives its slot holding the node; the download gate and the model links run on its node too. An
+object that predates the controller (B300's hand-made node-3 replica) is adopted metadata-only, never re-rendered.
+First use is B300 prod (b300-bangkok `gemma`, node-3 beside slot f13), not tm-h20. Still deployment-only.
 
 ### Prefill and decode with different TP (gemma-4)
 
