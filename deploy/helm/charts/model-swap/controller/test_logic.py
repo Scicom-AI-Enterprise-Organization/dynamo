@@ -434,7 +434,8 @@ def test_extra_prefill_waits_for_the_slot_hash_and_for_its_cards():
     sp = extra_spec(V1)
     active = {"slot": "lab-sw-f1", "kind": "full", "model": V1, "snapshot": snap(V1),
               "hash": logic.config_hash(logic.with_defaults(sp))}
-    st = {"phase": "Serving", "active": active}
+    st = {"phase": "Serving", "active": active,
+          "links": {"a": {"target": snap(V1), "nodes": logic.graph_nodes(logic.with_defaults(sp))}}}
     acts, new = logic.decide("sw", sp, st, {"lab-sw-f1": {"state": "pending", "hash": ""}}, lambda p: (True, ""))
     assert not [a for a in acts if a[0] == "extra-create"] and "hash" in new["extra"]["state"]
     acts, new = logic.decide("sw", sp, st, {"lab-sw-f1": {"state": "ready", "hash": "deadbeef"}}, lambda p: (True, ""),
@@ -442,6 +443,23 @@ def test_extra_prefill_waits_for_the_slot_hash_and_for_its_cards():
     assert not [a for a in acts if a[0] == "extra-create"] and new["extra"]["state"].startswith("waiting")
     acts, new = logic.decide("sw", sp, st, {"lab-sw-f1": {"state": "ready", "hash": "deadbeef"}}, lambda p: (True, ""))
     assert [a for a in acts if a[0] == "extra-create"] == [("extra-create", "sw-prefill2-f1", "lab-sw-f1", "deadbeef")]
+
+
+def test_extra_prefill_points_the_model_link_before_it_starts():
+    """A serving slot never points its link itself (only a swap does), and a node cleaned since has none: enabling the
+    extra must run the link job first, or its engine starts on a missing --model path."""
+    sp = extra_spec(V1)
+    active = {"slot": "lab-sw-f1", "kind": "full", "model": V1, "snapshot": snap(V1),
+              "hash": logic.config_hash(logic.with_defaults(sp))}
+    slots = {"lab-sw-f1": {"state": "ready", "hash": "deadbeef"}}
+    acts, new = logic.decide("sw", sp, {"phase": "Serving", "active": active}, slots, lambda p: (True, ""))
+    assert [a[0] for a in acts] == ["job"] and acts[0][2] == "link"
+    assert acts[0][3] == {"kind": "full", "target": snap(V1)} and new["extra"]["state"] == "pointing the model link"
+    assert not [a for a in acts if a[0] == "extra-create"]
+    jobs = {acts[0][1]: {"state": "succeeded", "result": {}}}
+    acts, new = logic.decide("sw", sp, new, slots, lambda p: (True, ""), jobs=jobs)
+    assert [a for a in acts if a[0] == "extra-create"] == [("extra-create", "sw-prefill2-f1", "lab-sw-f1", "deadbeef")]
+    assert new["extra"]["state"] == "creating"
 
 
 def test_extra_prefill_renders_the_slot_namespace_link_and_placement():

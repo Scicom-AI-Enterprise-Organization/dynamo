@@ -121,6 +121,8 @@ extraPrefill:
   the controller never edits an existing extra prefill's spec (a metadata-only adoption if the object predates it).
 - **In-place reloads** load the new weights into it too; if it is not ready, the reload falls back to the bridge, which
   replaces the slot and with it the extra prefill.
+- **Enabling it on a slot that already serves** points the slot's model link on its node first (a Job per node, as a
+  swap does), so a node cleaned since the slot started does not launch an engine on a missing `--model` path.
 - The download gate and the model links run on its node as well (`graph_nodes`), so a swap checks the model there and
   points the link before the extra prefill starts.
 

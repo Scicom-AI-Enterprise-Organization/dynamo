@@ -477,14 +477,16 @@ def decide(swap: str, spec: dict, status: dict, slots: dict, preflight, now: flo
         for a in acts:                       # an in-place reload must load the new weights into the extra prefill too
             if a[0] == "reload" and extra_prefill_name(swap, a[1]) in (extras or {}):
                 a[2]["extra"] = extra_prefill_name(swap, a[1])
-    _reconcile_extra(swap, s, st, slots, acts, extras or {}, preflight_extra or preflight)
+    _reconcile_extra(swap, s, st, slots, acts, extras or {}, preflight_extra or preflight, jobs or {})
     return acts, st
 
 
-def _reconcile_extra(swap: str, s: dict, st: dict, slots: dict, acts: list, extras: dict, preflight) -> None:
-    """Keep exactly one extra prefill: the one that follows the serving full slot. It is created once the slot's worker
-    hash is known (the frontend's prefill router is per runtime namespace) and its cards are free, adopted when it
-    already exists (a replica that predates this controller: metadata only, its engine keeps its worker hash), and
+def _reconcile_extra(swap: str, s: dict, st: dict, slots: dict, acts: list, extras: dict, preflight,
+                     jobs: dict) -> None:
+    """Keep exactly one extra prefill: the one that follows the serving full slot. It is created once the slot's model
+    link is on its node (a serving slot never points it itself, and a node cleaned since the slot started has none), its
+    worker hash is known (the frontend's prefill router is per runtime namespace) and its cards are free, adopted when
+    it already exists (a replica that predates this controller: metadata only, its engine keeps its worker hash), and
     deleted when the slot it followed is retiring or gone, so it never outlives its slot holding the node."""
     target = next((x for x in (st.get("active"), st.get("next")) if x and x.get("kind") == "full"), None)
     want = extra_prefill_name(swap, target["slot"]) if (extra_config(s) and target) else ""
@@ -499,6 +501,32 @@ def _reconcile_extra(swap: str, s: dict, st: dict, slots: dict, acts: list, extr
         if not extras[want].get("labeled") or not extras[want].get("owned"):
             acts.append(("extra-adopt", want, target["slot"]))
         return
+    if not target.get("snapshot"):
+        st["extra"]["state"] = "the slot does not load from a model link"
+        return
+    # The extra prefill loads --model from the slot's link, and only a swap points that link: enabling the extra on a
+    # slot that already serves (or on a node cleaned since) must point it first, or the engine starts on a missing path.
+    pset, nodes = "a", graph_nodes(s)
+    links = st.setdefault("links", {})
+    if links.get(pset) != {"target": target["snapshot"], "nodes": nodes}:
+        p = st.get("linking") or {}
+        if (p.get("set"), p.get("target"), p.get("nodes")) != (pset, target["snapshot"], nodes):
+            st["seq"] = int(st.get("seq") or 0) + 1
+            p = {"set": pset, "target": target["snapshot"], "nodes": nodes, "key": f"link-{pset}-{st['seq']}"}
+            st["linking"] = p
+        j = jobs.get(p["key"]) or {}
+        if j.get("state") == "succeeded":
+            links[pset] = {"target": target["snapshot"], "nodes": nodes}
+            st["linking"] = None
+        elif j.get("state") == "failed":
+            st["linking"] = None
+            st["extra"]["state"] = f"model link failed: {j.get('error') or 'job failed'}"[:200]
+            return
+        else:
+            if not j:
+                acts.append(("job", p["key"], "link", {"kind": "full", "target": target["snapshot"]}))
+            st["extra"]["state"] = "pointing the model link"
+            return
     worker_hash = (slots.get(target["slot"]) or {}).get("hash") or ""
     if not worker_hash:
         st["extra"]["state"] = "waiting for the slot's worker hash"

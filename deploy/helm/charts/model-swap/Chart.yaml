@@ -19,9 +19,9 @@ description: |
   it, deleted with it, reloaded with it), joining the slot's runtime namespace so the frontend's prefill router
   uses both.
 type: application
-version: 0.4.0
+version: 0.4.1
 # appVersion tracks the controller code in controller/ (shipped in a ConfigMap, run on a stock python image).
-appVersion: "0.4.0"
+appVersion: "0.4.1"
 keywords:
   - dynamo
   - vllm

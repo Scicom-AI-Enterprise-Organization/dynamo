@@ -76,6 +76,10 @@ weights and never outlives its slot holding the node; the download gate and the 
 object that predates the controller (B300's hand-made node-3 replica) is adopted metadata-only, never re-rendered.
 First use is B300 prod (b300-bangkok `gemma`, node-3 beside slot f13), not tm-h20. Still deployment-only.
 
+**0.4.1**: enabling the extra prefill on a slot that already serves points the slot's model link on its node first, a
+Job per node like a swap's. Only a swap used to write that link, so enabling the extra on a serving slot (or on a node
+whose link had been cleaned) started its engine on a missing `--model` path.
+
 ### Prefill and decode with different TP (gemma-4)
 
 `patches/vllm-0.31.0-nixl-per-region-kv-heads.patch`, applied with
