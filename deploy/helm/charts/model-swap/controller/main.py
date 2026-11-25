@@ -39,6 +39,9 @@ G_LABEL = "nvidia.com/dynamo-graph-deployment-name"
 L_JOB, L_NODE = f"{logic.GROUP}/job", f"{logic.GROUP}/node"
 PAUSE_CAP = float(os.environ.get("PAUSE_CAP_SECONDS", "60"))
 FETCH_SRC = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "fetch.py")).read()
+# The extra prefill that follows the serving full slot (chart values, so it is not part of the CR and starts no swap):
+# {enabled, nodeSelector, gpuUUIDs}. Its engine spec is the graph's prefill.
+EXTRA = json.loads(os.environ.get("EXTRA_PREFILL_JSON") or "{}")
 # The namespace's compile-cache store (a ReadWriteMany claim the chart makes; empty: no seeding), mounted by the
 # cache-seed and cache-publish Jobs at /store, one directory per namespace.
 STORE_PVC = os.environ.get("CACHE_STORE_PVC", "")
@@ -197,37 +200,43 @@ def admin(addr: tuple, route: str, body: dict, timeout: float) -> dict:
         return json.loads(r.read() or b"{}")
 
 
-def slot_workers(slot: str) -> dict:
-    """{role: (host ip, system port)} of a slot's Ready prefill and decode pods (hostNetwork: pod IP = host IP)."""
+def slot_workers(slot: str, extra: str = "") -> dict:
+    """{role: (host ip, system port)} of a slot's Ready prefill and decode pods, plus its extra prefill when it has one
+    (role "prefill2"; hostNetwork: pod IP = host IP)."""
     out = {}
-    for p in client.CoreV1Api().list_namespaced_pod(NS, label_selector=f"{G_LABEL}={slot}").items:
-        role = (p.metadata.labels or {}).get("nvidia.com/dynamo-component-type")
-        if role not in logic.ROLES or logic.pod_state(_api(p)) != "ready":
+    sel = f"{G_LABEL} in ({slot},{extra})" if extra else f"{G_LABEL}={slot}"
+    for p in client.CoreV1Api().list_namespaced_pod(NS, label_selector=sel).items:
+        labels = p.metadata.labels or {}
+        role = "prefill2" if extra and labels.get(G_LABEL) == extra else labels.get("nvidia.com/dynamo-component-type")
+        if role not in (*logic.ROLES, "prefill2") or logic.pod_state(_api(p)) != "ready":
             continue
         c = next((c for c in p.spec.containers if c.name == "main"), p.spec.containers[0])
         port = next((e.value for e in c.env or [] if e.name == "DYN_SYSTEM_PORT"), None)
         if role in out or not port:
             raise RuntimeError(f"slot {slot}: expected one Ready {role} pod with DYN_SYSTEM_PORT")
         out[role] = (p.status.pod_ip, int(port))
-    if set(out) != set(logic.ROLES):
-        raise RuntimeError(f"slot {slot}: Ready workers are {sorted(out)}, not prefill + decode")
+    want = {*logic.ROLES, *(["prefill2"] if extra else [])}
+    if set(out) != want:
+        raise RuntimeError(f"slot {slot}: Ready workers are {sorted(out)}, not {sorted(want)}")
     return out
 
 
-def reload_in_place(slot: str, p: dict, fe_ips: list[str], served: str) -> dict:
-    """Pause prefill then decode (wait mode: running requests finish, new ones queue; at most PAUSE_CAP s each), load
-    p["to"] into both, resume decode then prefill, then check both report the new version and the frontends answer.
-    Any failure loads p["from"] back. Returns the outcome decide() reads from status["reload"]."""
+def reload_in_place(slot: str, p: dict, fe_ips: list[str], served: str, extra: str = "") -> dict:
+    """Pause the workers then decode (wait mode: running requests finish, new ones queue; at most PAUSE_CAP s each),
+    load p["to"] into all of them (the extra prefill too, or it would keep serving the old weights), resume decode then
+    the prefills, then check all report the new version and the frontends answer. Any failure loads p["from"] back.
+    Returns the outcome decide() reads from status["reload"]."""
     res = {"hash": p["hash"], "ok": False, "to": p["to"]}
-    roles = ("prefill", "decode")
     try:
-        w = slot_workers(slot)
+        w = slot_workers(slot, extra)
     except Exception as e:
         return {**res, "why": str(e)[:300]}
+    pause_order = [r for r in ("prefill", "prefill2", "decode") if r in w]
+    resume_order = [r for r in ("decode", "prefill2", "prefill") if r in w]
 
-    def each(route, body, timeout, order=roles):
+    def each(route, body, timeout, order=pause_order):
         out = {}
-        with ThreadPoolExecutor(2) as ex:
+        with ThreadPoolExecutor(len(order)) as ex:
             futs = {r: ex.submit(admin, w[r], route, body, timeout) for r in order}
             for r, fu in futs.items():
                 try:
@@ -237,7 +246,7 @@ def reload_in_place(slot: str, p: dict, fe_ips: list[str], served: str) -> dict:
         return out
 
     def resume():                       # decode first, so the prefill's first new requests find it ready
-        return {r: admin(w[r], "resume_generation", {}, 600) for r in ("decode", "prefill")}
+        return {r: admin(w[r], "resume_generation", {}, 600) for r in resume_order}
 
     def back(why):
         """Old weights back in (the engines must be paused), resume, and report why."""
@@ -248,7 +257,7 @@ def reload_in_place(slot: str, p: dict, fe_ips: list[str], served: str) -> dict:
         return {**res, "why": why[:300], "rolledBack": ok}
 
     t0 = time.time()
-    for r in roles:
+    for r in pause_order:
         try:
             x = admin(w[r], "pause_generation", {"mode": "wait"}, PAUSE_CAP)
             if x.get("status") != "ok":
@@ -263,10 +272,10 @@ def reload_in_place(slot: str, p: dict, fe_ips: list[str], served: str) -> dict:
         return back(f"update_weights_from_disk: {up}")
     resume()
     t_resumed = time.time()
-    versions = {r: admin(w[r], "get_weight_version", {}, 10).get("version") for r in roles}
+    versions = {r: admin(w[r], "get_weight_version", {}, 10).get("version") for r in pause_order}
     probes = [probe(ip, served) for ip in fe_ips for _ in range(2)]
     if any(v != p["version"] for v in versions.values()) or any(x != "200" for x in probes) or not probes:
-        for r in roles:
+        for r in pause_order:
             admin(w[r], "pause_generation", {"mode": "wait"}, max(PAUSE_CAP, 120))
         return back(f"check failed: versions {versions}, probes {probes}")
     return {**res, "ok": True, "pausedSeconds": round(t_resumed - t0, 1), "drainSeconds": round(t_paused - t0, 1),
@@ -340,12 +349,16 @@ def _api(obj) -> dict:
 
 def reconcile(cr: dict) -> None:
     name, spec = cr["metadata"]["name"], cr.get("spec") or {}
+    spec = {**spec, "extraPrefill": EXTRA}     # chart values: not in the CR, so it is not part of a slot's hash
     status = {k: v for k, v in (cr.get("status") or {}).items() if k != "history"}
     s = logic.with_defaults(spec)
     co, core = client.CustomObjectsApi(), client.CoreV1Api()
     sel = f"{logic.L_SWAP}={name}"
     dgds = {d["metadata"]["name"]: d for d in
             co.list_namespaced_custom_object(DGD_GROUP, DGD_VERSION, NS, DGD_PLURAL, label_selector=sel)["items"]}
+    extras = {d["metadata"]["name"]: {} for d in
+              co.list_namespaced_custom_object(DGD_GROUP, DGD_VERSION, NS, DGD_PLURAL,
+                                               label_selector=f"{logic.L_EXTRA}={name}")["items"]}
     # Pods by the graph label the Dynamo operator sets on every pod of a DGD (podTemplate labels are not relied on).
     mine = re.compile(rf"^{re.escape(s['frontendGraph'])}-{re.escape(name)}-[fb]\d+$")
     pods: dict = {}
@@ -360,25 +373,30 @@ def reconcile(cr: dict) -> None:
         listed, acked, decode_id = slot_view(sl, views)
         prefill_pods = [p for p in pods.get(sl, [])
                         if (p["metadata"].get("labels") or {}).get("nvidia.com/dynamo-component-type") == "prefill"]
+        # The slot's worker hash: the extra prefill joins the slot's runtime namespace with it.
+        worker_hash = next(((p["metadata"].get("labels") or {}).get("nvidia.com/dynamo-worker-hash") for p in pods.get(sl, [])
+                            if (p["metadata"].get("labels") or {}).get("nvidia.com/dynamo-worker-hash")), "")
         slots[sl] = {"state": logic.slot_state(dgds.get(sl), pods.get(sl, [])), "listed": listed, "acked": acked,
-                     "decode": decode_id, "retired": retired(dgds.get(sl)),
+                     "decode": decode_id, "retired": retired(dgds.get(sl)), "hash": worker_hash,
                      "prefill": "present" if prefill_pods else "missing"}
 
     cache: list = []
 
-    def preflight(pct: int):
+    def preflight(pct: int, gpus=None):
         if not cache:
             cache.extend(_api(p) for p in core.list_pod_for_all_namespaces().items)
-        return logic.gpu_preflight(cache, logic.graph_gpus(s), int(pct))
+        return logic.gpu_preflight(cache, gpus or logic.graph_gpus(s), int(pct))
 
-    acts, new = logic.decide(name, spec, status, slots, preflight, time.time(), job_views(name), bool(STORE_PVC))
+    acts, new = logic.decide(name, spec, status, slots, preflight, time.time(), job_views(name), bool(STORE_PVC),
+                             extras, lambda pct: preflight(pct, logic.extra_gpus(s)))
 
     for act in acts:
         if act[0] == "job":
             ensure_job(cr, s, act[1], act[2], act[3])
         elif act[0] == "reload":
             log(f"{name}: reloading {act[1]} in place: {act[2]['from']} -> {act[2]['to']}")
-            out = reload_in_place(act[1], act[2], [p.status.pod_ip for p in fe], s["servedModelName"])
+            out = reload_in_place(act[1], act[2], [p.status.pod_ip for p in fe], s["servedModelName"],
+                                  act[2].get("extra") or "")
             new["reload"] = out
             log(f"{name}: in-place reload of {act[1]}: {out}")
             if out["ok"]:
@@ -418,6 +436,31 @@ def reconcile(cr: dict) -> None:
             with ThreadPoolExecutor(8) as ex:
                 res = list(ex.map(lambda ip: probe(ip, s["servedModelName"]), [p.status.pod_ip for p in fe] * 4))
             log(f"{name}: probe for {act[1]}: {res}")
+        elif act[0] == "extra-create":
+            body = logic.render_extra_prefill(name, NS, s, act[2], act[3])
+            body["metadata"]["ownerReferences"] = [{"apiVersion": cr["apiVersion"], "kind": cr["kind"], "name": name,
+                                                    "uid": cr["metadata"]["uid"], "controller": True}]
+            try:
+                co.create_namespaced_custom_object(DGD_GROUP, DGD_VERSION, NS, DGD_PLURAL, body)
+                log(f"{name}: created extra prefill {act[1]} on {logic.extra_node(s)} for {act[2]}")
+            except ApiException as e:
+                if e.status != 409:
+                    raise
+                # Adopt an extra prefill that predates this controller (the hand-made node-3 replica): metadata only,
+                # never its spec, so its engine keeps running under the worker hash it registered with.
+                cur = co.get_namespaced_custom_object(DGD_GROUP, DGD_VERSION, NS, DGD_PLURAL, act[1])
+                co.patch_namespaced_custom_object(DGD_GROUP, DGD_VERSION, NS, DGD_PLURAL, act[1], {"metadata": {
+                    "labels": {**(cur["metadata"].get("labels") or {}), **body["metadata"]["labels"]},
+                    "ownerReferences": cur["metadata"].get("ownerReferences") or body["metadata"]["ownerReferences"]}})
+                log(f"{name}: adopted extra prefill {act[1]} for {act[2]}")
+        elif act[0] == "extra-delete":
+            try:
+                co.delete_namespaced_custom_object(DGD_GROUP, DGD_VERSION, NS, DGD_PLURAL, act[1],
+                                                   propagation_policy="Background")
+                log(f"{name}: deleted extra prefill {act[1]}")
+            except ApiException as e:
+                if e.status != 404:
+                    raise
 
     new["slots"] = {k: {kk: v[kk] for kk in ("state", "listed", "acked", "retired")} for k, v in sorted(slots.items())}
     new["frontends"] = len(fe)

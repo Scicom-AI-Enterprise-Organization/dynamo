@@ -14,10 +14,14 @@ description: |
   the same namespace finds them through Dynamo's namespace-prefix discovery. Needs the Dynamo operator (any
   release with v1beta1 DynamoGraphDeployments) and HAMi for GPU pinning and sharing. Scicom add-on; not in
   upstream ai-dynamo/dynamo.
+
+  extraPrefill: a second prefill worker on its own node and cards that follows the serving full slot (created with
+  it, deleted with it, reloaded with it), joining the slot's runtime namespace so the frontend's prefill router
+  uses both.
 type: application
-version: 0.3.0
+version: 0.4.0
 # appVersion tracks the controller code in controller/ (shipped in a ConfigMap, run on a stock python image).
-appVersion: "0.3.0"
+appVersion: "0.4.0"
 keywords:
   - dynamo
   - vllm

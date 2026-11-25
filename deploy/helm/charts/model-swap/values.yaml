@@ -50,6 +50,15 @@ cacheStore:
   # Longest a slot's engines wait for seeding before they start with whatever their node cache holds.
   timeoutSeconds: 300
 
+# A second prefill worker that follows the serving full slot on its own node and cards: its own DGD
+# <swap>-prefill2-<f|b><n>, the graph's prefill component on this node, registered in the slot's runtime namespace so
+# the frontend's prefill router for that worker set uses it. Created with the full slot and deleted with it. Chart
+# values, not CR fields: enabling it starts no swap.
+extraPrefill:
+  enabled: false
+  nodeSelector: {}
+  gpuUUIDs: ""
+
 resources:
   requests:
     cpu: 50m
