@@ -108,8 +108,11 @@ class World:
             elif a[0] == "extra-create":
                 assert self.links["a"] == snap(logic.model_ref(s)), f"extra {a[1]} created before the slot's link moved"
                 assert a[3] == self.view()[a[2]]["hash"], "extra prefill joined with the wrong worker hash"
-                self.extras[a[1]] = {"slot": a[2], "hash": a[3]}
+                self.extras[a[1]] = {"slot": a[2], "hash": a[3], "labeled": True, "owned": True}
                 self.log.append(("+extra", a[1], a[2]))
+            elif a[0] == "extra-adopt" and a[1] in self.extras:
+                self.extras[a[1]].update(labeled=True, owned=True)
+                self.log.append(("adopt-extra", a[1]))
             elif a[0] == "extra-delete" and a[1] in self.extras:
                 del self.extras[a[1]]
                 self.log.append(("-extra", a[1]))
@@ -472,6 +475,19 @@ def test_inplace_reload_loads_the_extra_prefill_too():
     w.run(extra_spec(V2, alias=False), serving(V2))
     assert w.last_reload and w.last_reload["extra"] == "sw-prefill2-f1"
     assert list(w.extras) == ["sw-prefill2-f1"]              # same slot: the extra was reloaded, not replaced
+
+
+def test_extra_prefill_is_adopted_when_it_predates_the_controller():
+    """The hand-made replica: it exists but carries no label or owner, and its cards are taken (by itself), so a create
+    attempt would be refused by the preflight. Adopt it, metadata only, and never create a second one."""
+    sp = extra_spec(V1)
+    active = {"slot": "lab-sw-f1", "kind": "full", "model": V1, "snapshot": snap(V1),
+              "hash": logic.config_hash(logic.with_defaults(sp))}
+    acts, new = logic.decide("sw", sp, {"phase": "Serving", "active": active},
+                             {"lab-sw-f1": {"state": "ready", "hash": "deadbeef"}},
+                             lambda p: (False, "no HAMi room"), extras={"sw-prefill2-f1": {"labeled": False}})
+    assert ("extra-adopt", "sw-prefill2-f1", "lab-sw-f1") in acts
+    assert not [a for a in acts if a[0] == "extra-create"] and new["extra"]["state"] == "present"
 
 
 def test_disabling_the_extra_prefill_deletes_it():

@@ -347,6 +347,19 @@ def _api(obj) -> dict:
     return client.ApiClient().sanitize_for_serialization(obj)
 
 
+def adopt_extra(cr: dict, extra: str, slot: str) -> None:
+    """Label and own an extra prefill that predates this controller (the hand-made node-3 replica): metadata only,
+    never its spec, so its engine keeps running under the worker hash it registered with."""
+    co = client.CustomObjectsApi()
+    md = co.get_namespaced_custom_object(DGD_GROUP, DGD_VERSION, NS, DGD_PLURAL, extra)["metadata"]
+    co.patch_namespaced_custom_object(DGD_GROUP, DGD_VERSION, NS, DGD_PLURAL, extra, {"metadata": {
+        "labels": {**(md.get("labels") or {}), logic.L_EXTRA: cr["metadata"]["name"], logic.L_SLOT: slot},
+        "ownerReferences": md.get("ownerReferences") or [
+            {"apiVersion": cr["apiVersion"], "kind": cr["kind"], "name": cr["metadata"]["name"],
+             "uid": cr["metadata"]["uid"], "controller": True}]}})
+    log(f"{cr['metadata']['name']}: adopted extra prefill {extra} for {slot}")
+
+
 def reconcile(cr: dict) -> None:
     name, spec = cr["metadata"]["name"], cr.get("spec") or {}
     spec = {**spec, "extraPrefill": EXTRA}     # chart values: not in the CR, so it is not part of a slot's hash
@@ -354,11 +367,14 @@ def reconcile(cr: dict) -> None:
     s = logic.with_defaults(spec)
     co, core = client.CustomObjectsApi(), client.CoreV1Api()
     sel = f"{logic.L_SWAP}={name}"
-    dgds = {d["metadata"]["name"]: d for d in
-            co.list_namespaced_custom_object(DGD_GROUP, DGD_VERSION, NS, DGD_PLURAL, label_selector=sel)["items"]}
-    extras = {d["metadata"]["name"]: {} for d in
-              co.list_namespaced_custom_object(DGD_GROUP, DGD_VERSION, NS, DGD_PLURAL,
-                                               label_selector=f"{logic.L_EXTRA}={name}")["items"]}
+    all_dgds = co.list_namespaced_custom_object(DGD_GROUP, DGD_VERSION, NS, DGD_PLURAL)["items"]
+    dgds = {d["metadata"]["name"]: d for d in all_dgds if (d["metadata"].get("labels") or {}).get(logic.L_SWAP) == name}
+    # An extra prefill is found by name too: one created before this controller (the hand-made replica) carries no label
+    # yet, and it must be adopted, not duplicated on the same cards.
+    extra_re = re.compile(rf"^{re.escape(name)}-prefill2-[fb]\d+$")
+    extras = {d["metadata"]["name"]: {"labeled": logic.L_EXTRA in (d["metadata"].get("labels") or {}),
+                                      "owned": bool(d["metadata"].get("ownerReferences"))}
+              for d in all_dgds if extra_re.match(d["metadata"]["name"])}
     # Pods by the graph label the Dynamo operator sets on every pod of a DGD (podTemplate labels are not relied on).
     mine = re.compile(rf"^{re.escape(s['frontendGraph'])}-{re.escape(name)}-[fb]\d+$")
     pods: dict = {}
@@ -436,6 +452,8 @@ def reconcile(cr: dict) -> None:
             with ThreadPoolExecutor(8) as ex:
                 res = list(ex.map(lambda ip: probe(ip, s["servedModelName"]), [p.status.pod_ip for p in fe] * 4))
             log(f"{name}: probe for {act[1]}: {res}")
+        elif act[0] == "extra-adopt":
+            adopt_extra(cr, act[1], act[2])
         elif act[0] == "extra-create":
             body = logic.render_extra_prefill(name, NS, s, act[2], act[3])
             body["metadata"]["ownerReferences"] = [{"apiVersion": cr["apiVersion"], "kind": cr["kind"], "name": name,
@@ -446,13 +464,7 @@ def reconcile(cr: dict) -> None:
             except ApiException as e:
                 if e.status != 409:
                     raise
-                # Adopt an extra prefill that predates this controller (the hand-made node-3 replica): metadata only,
-                # never its spec, so its engine keeps running under the worker hash it registered with.
-                cur = co.get_namespaced_custom_object(DGD_GROUP, DGD_VERSION, NS, DGD_PLURAL, act[1])
-                co.patch_namespaced_custom_object(DGD_GROUP, DGD_VERSION, NS, DGD_PLURAL, act[1], {"metadata": {
-                    "labels": {**(cur["metadata"].get("labels") or {}), **body["metadata"]["labels"]},
-                    "ownerReferences": cur["metadata"].get("ownerReferences") or body["metadata"]["ownerReferences"]}})
-                log(f"{name}: adopted extra prefill {act[1]} for {act[2]}")
+                adopt_extra(cr, act[1], act[2])
         elif act[0] == "extra-delete":
             try:
                 co.delete_namespaced_custom_object(DGD_GROUP, DGD_VERSION, NS, DGD_PLURAL, act[1],
