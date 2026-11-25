@@ -483,8 +483,9 @@ def decide(swap: str, spec: dict, status: dict, slots: dict, preflight, now: flo
 
 def _reconcile_extra(swap: str, s: dict, st: dict, slots: dict, acts: list, extras: dict, preflight) -> None:
     """Keep exactly one extra prefill: the one that follows the serving full slot. It is created once the slot's worker
-    hash is known (the frontend's prefill router is per runtime namespace) and its cards are free, and deleted when the
-    slot it followed is retiring or gone, so it never outlives its slot holding the node."""
+    hash is known (the frontend's prefill router is per runtime namespace) and its cards are free, adopted when it
+    already exists (a replica that predates this controller: metadata only, its engine keeps its worker hash), and
+    deleted when the slot it followed is retiring or gone, so it never outlives its slot holding the node."""
     target = next((x for x in (st.get("active"), st.get("next")) if x and x.get("kind") == "full"), None)
     want = extra_prefill_name(swap, target["slot"]) if (extra_config(s) and target) else ""
     st["extra"] = {"enabled": bool(extra_config(s)), "name": want or None}
@@ -495,6 +496,8 @@ def _reconcile_extra(swap: str, s: dict, st: dict, slots: dict, acts: list, extr
         return
     if want in extras:
         st["extra"]["state"] = "present"
+        if not extras[want].get("labeled") or not extras[want].get("owned"):
+            acts.append(("extra-adopt", want, target["slot"]))
         return
     worker_hash = (slots.get(target["slot"]) or {}).get("hash") or ""
     if not worker_hash:
