@@ -231,3 +231,132 @@ loopback sockets) is unchanged.
 
 The `binfmt_misc` line at the top of CRIU's log is not fatal; it appears in
 every dump. The fatal line is the last `Error` before `Dumping FAILED`.
+
+## 2026-11-27 09:45Z: v4 capture over TCP loopback
+
+The TCP pair captured cleanly: `snapfix-pd-prefill-v4` and
+`snapfix-pd-decode-v4` reached `Ready=True` with "Checkpoint captured and
+verified" at 09:45:00Z. CRIU dump: prefill 76.4s, decode 76.0s (the v1
+capture was 55.1s/50.0s; the difference is the larger page set and the
+cache-backed model).
+
+**Scope:** this run proves the snapshot capture/restore mechanism over TCP
+loopback (`UCX_TLS=tcp,cuda_copy,cuda_ipc`, `UCX_NET_DEVICES=lo`), not over
+RDMA. CRIU cannot dump the `/dev/infiniband/uverbsN` file descriptors, so the
+`rc_x`/RoCE path is not in this proof. Production Gemma uses NIXL over RoCE;
+this run does not establish that a restored engine can re-establish NIXL over
+RoCE.
+
+## 2026-11-27 09:53Z: v4 restore completed, then the restore-context race
+
+Both v4 restores completed at the CRIU/CUDA level:
+
+| Worker | Total | CRIU restore | CUDA restore |
+|---|---|---|---|
+| Prefill | 1m10.6s | 62.8s | 5.1s |
+| Decode | 1m24.7s | 77.7s | 4.9s |
+
+The restored processes then failed before the `a94bd0a` hook ran:
+
+```text
+RuntimeError: snapshot restore context file not found: /snapshot-control/restore-context.json
+```
+
+`/snapshot-control` in the restored pod contains `restore-complete` and
+`snapshot-restore-proxy`, but no `restore-context.json`. The restore standby
+(`DYN_SNAPSHOT_RESTORE_STANDBY=1`) did not leave the file; the agent pod had
+restarted three times during the node recovery, and the standby env was not
+present in the restore pod's target containers. Workaround for the next
+capture: set `DYN_SNAPSHOT_RESTORE_STANDBY=1` explicitly in the restore DGD's
+target containers so the placeholder writes the context before CRIU resumes.
+This is a restore-agent/standby issue, not the GPU restore; the v4 snapshot is
+consumed.
+
+## 2026-11-27 10:25Z: v5 TCP restore and the fresh-frontend design
+
+The v5 pair (TCP/loopback: `UCX_TLS=tcp,cuda_copy,cuda_ipc`,
+`UCX_NET_DEVICES=lo`) restored cleanly:
+
+| Worker | Total | CRIU restore | CUDA restore |
+|---|---|---|---|
+| Prefill | 1m25.8s | 79.5s | 4.6s |
+| Decode | 1m1.7s | 53.9s | 5.0s |
+
+The restore DGD sets `nvidia.com/restore-from` only on the prefill and decode
+components. The Frontend is a normal, fresh Deployment, not a restore target:
+**snapshot the engines, not the router.** The v1/v4/v5 `make_restore_dgd.py`
+skips the Frontend for the same reason.
+
+The first fresh frontend still listed 0 instances. The causes were not a stale
+restored router:
+
+1. The frontend's `DYN_NAMESPACE` was `snapfix-lab-snapfix-pd`, while the
+   restored workers registered under `snapfix-lab-snapfix-pd-bb2dcf2e`.
+2. The restored `DynamoWorkerMetadata` CRs had no
+   `nvidia.com/dynamo-discovery-backend=kubernetes` or
+   `nvidia.com/dynamo-discovery-enabled=true` labels; the frontend's CR
+   reflector selects on both.
+3. The workers were 0/1: their 9090 `/live` server answered on `127.0.0.1`,
+   but the kubelet's probe to `10.0.11.1:9090` was dropped by node-3's
+   wall-live self-DROP. Removing only the `10.0.11.1` self-DROP rules made
+   both workers 1/1.
+
+After those, `/health` listed the prefill and backend endpoints (six
+instances) and `/v1/models` returned the model. The frontend then served a
+6,360-character prompt through the prefill/decode pair.
+
+TTFT, one warmup then five requests, 8 max tokens: 1,402 / 1,444 / 1,473 /
+1,454 / 1,464 ms. The baseline is 141-168 ms. **NIXL here is the TCP
+fallback, not RoCE**; the ~10x TTFT is the transport cost, not the GPU
+restore.
+
+## The restore-standby defect (upstream)
+
+`/snapshot-control/restore-context.json` was absent after the restore, and the
+restored process raised:
+
+```text
+RuntimeError: snapshot restore context file not found: /snapshot-control/restore-context.json
+```
+
+The restore only proceeded after the file was written by hand. The standby
+entrypoint is `maybe_run_restore_standby_mode` in
+`dynamo/common/snapshot/restore_context.py`, enabled by
+`DYN_SNAPSHOT_RESTORE_STANDBY=1`; it calls `write_snapshot_restore_context()`
+and then sleeps. The file should contain:
+
+```json
+{"env": {"<name>": "<value-or-null>", "...": "..."}}
+```
+
+with the destination container's supported Kubernetes/runtime env names
+(`KUBERNETES_REQUIRED_ENV_NAMES`, `KUBERNETES_OPTIONAL_ENV_NAMES`,
+`RESTORE_RUNTIME_ENV_NAMES`), and null for names that are absent. The v4/v5
+`/snapshot-control` directories contained only `restore-complete` and
+`snapshot-restore-proxy`; the standby either did not run or its file was
+removed by the overlay. This is an upstream snapshot-agent defect, not the GPU
+restore.
+
+## Can a restored pair use RoCE?
+
+No, not with the current mechanism. CRIU cannot dump the
+`/dev/infiniband/uverbsN` file descriptors: the VMA plugin can claim the
+mappings, but the fd dump still fails with
+`files-ext.c: Can't dump file ... (chr 231:192)`, and the QP/MR state is not
+checkpointed. vLLM's `NixlConnector` opens the uverbs fds during engine init,
+before the `ready-for-snapshot` gate, so "capture before the transport
+connects" is not sufficient.
+
+A RoCE snapshot needs a pre-dump hook that shuts down NIXL/UCX (closing the
+uverbs fds) and a post-restore hook that reinitializes NIXL and re-establishes
+the prefill/decode connections. That is a vLLM/NIXL lifecycle change of the
+same class as the compiled-kernel rebuild; the current branch does not have
+it. The TCP fallback is the only working path and costs ~10x TTFT.
+
+## `a94bd0a` hook status
+
+The lab placeholder image does not contain `_rebuild_compiled_kernel_state`
+(`grep` count 0). The restored process recompiled a Triton kernel on demand
+(`_gumbel_sample_kernel` JIT), so the restore worked, but the hook itself is
+not proven in the image. The image needs rebuilding with the branch's
+`snapshot.py` before the hook can be exercised.
