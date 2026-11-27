@@ -1,0 +1,28 @@
+daemonset:
+  image:
+    repository: nvcr.io/nvidia/ai-dynamo/snapshot-agent
+    tag: 1.4.0
+    pullPolicy: IfNotPresent
+  imagePullSecrets: []
+  nodeSelector:
+    kubernetes.io/hostname: tm-ucc-c3ssfjix-0000
+  resources:
+    limits: {cpu: 8, memory: 192Gi}
+    requests: {cpu: 2, memory: 1Gi}
+storage:
+  type: pvc
+  accessMode: agentMount
+  pvc:
+    create: false
+    name: snapfix-pd-pvc
+    basePath: /checkpoints
+runtime:
+  type: containerd
+  socketPath: /run/k3s/containerd/containerd.sock
+  storageDir: /var/lib/rancher/k3s/agent/containerd
+  storageDir: /var/lib/rancher/k3s/agent/containerd
+seccomp:
+  deploy: true
+rbac:
+  create: true
+  namespaceRestricted: true

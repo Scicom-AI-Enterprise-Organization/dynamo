@@ -1,0 +1,38 @@
+# Snapshot lab on node-3 (tm-ucc-c3ssfjix-0000), chart 0.3.0 (the lab's stack).
+# Fix under test: config.criu.mntnsCompatMode=true BEFORE capture, so the
+# checkpoint manifest carries it and CRIU restores with the legacy mount engine.
+daemonset:
+  nodeSelector:
+    kubernetes.io/hostname: tm-ucc-c3ssfjix-0000
+  resources:
+    limits:
+      cpu: 8
+      memory: 192Gi
+    requests:
+      cpu: 2
+      memory: 1Gi
+operator:
+  nodeSelector:
+    kubernetes.io/hostname: tm-ucc-c3ssfjix-0000
+storage:
+  type: pvc
+  pvc:
+    create: false
+    name: snapfix-pd-pvc
+    basePath: /checkpoints
+runtime:
+  type: containerd
+  socketPath: /run/k3s/containerd/containerd.sock
+  storageDir: /var/lib/rancher/k3s/agent/containerd
+config:
+  criu:
+    logLevel: 2
+    mntnsCompatMode: true
+    libDir: /usr/local/lib/criu
+pageBroker:
+  staging:
+    sizeLimit: 192Gi
+  resources:
+    limits:
+      cpu: 32
+      memory: 256Gi

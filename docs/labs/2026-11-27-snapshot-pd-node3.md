@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 title: Prefill/decode TP4 pair on one B300 node (2026-11-27)
-subtitle: The pair serves with NIXL over RoCE, but a PodSnapshot of the live workers cannot be captured; the snapshot lifecycle is a one-shot startup gate.
+subtitle: The pair serves with NIXL over RoCE; with the VMA plugin a PodSnapshot of the live workers captures, but the prefill snapshot is one-shot.
 ---
 
 ## What ran
@@ -163,3 +163,38 @@ the final restore-serving run. Cross-node restore was not attempted: node-4 is
 out of bounds, and a restore on a new node must re-resolve
 `VLLM_NIXL_SIDE_CHANNEL_HOST` to that node's host IP instead of the captured
 loopback value.
+
+## Final lab configuration (2026-11-27, node-3)
+
+Environment: B300 node-3 (`tm-ucc-c3ssfjix-0000`), kernel driver 580.105.08,
+CUDA 13 user-mode via `/data/snapfix/cuda-compat` (615.71.10), k3s v1.36.2+k3s1,
+HAMi, snapshot agent 0.3.0, chart `libDir=/criu-plugins`.
+
+Repro fixed here: `criu/mount-v2.c:897: Failed to copy sharing from
+-1:/dev/nvidia0 to 101: Invalid argument`, then
+`cr-restore.c:2419: Restoring FAILED`.
+
+Capture uses the hook-only `snapshot_nvidia_vma` CRIU plugin (majors 195/499)
+plus inet-remap; the full CRIU CUDA plugin is disabled. The pair is pinned to
+loopback for same-node capture/restore: `VLLM_HOST_IP=127.0.0.1`,
+`VLLM_NIXL_SIDE_CHANNEL_HOST=127.0.0.1`, `GLOO_SOCKET_IFNAME=lo`,
+`TP_SOCKET_IFNAME=lo`, `NCCL_SOCKET_IFNAME=lo`,
+`VLLM_ENGINE_ITERATION_TIMEOUT_S=600`.
+
+Capture: prefill 2m41s (CRIU 55.1s, CUDA 24.0s), decode 2m8s (CRIU 50.0s,
+CUDA 17.2s), both `Ready=True`. Restore: prefill 1m21s (CRIU 70.7s, CUDA 6.3s),
+decode 42.3s (CRIU 34.6s, CUDA 4.2s).
+
+## Restore result
+
+The restore pods schedule on node-3 once the k3s agent is Ready and the RDMA
+device plugin has re-registered. In this run `rdma-shared-dp-ds-k5bd2`
+restarted at 06:34:53Z, logged `exposing "63" devices`, and the HAMi scheduler
+caught up; the pods scheduled at 06:40:15/17Z.
+
+Decode restored (`Restore complete`, 06:41:44Z) but stayed 0/1 with
+`No available shared memory broadcast block found in 60 seconds`. Prefill
+failed with `Restore already used by an earlier container; restores are not
+repeatable` (06:41:45Z) and went into CrashLoopBackOff. The
+`snapfix-pd-prefill` PodSnapshot is consumed; a fresh capture under a new
+snapshot name is required before the serving/TTFT/NIXL proof can complete.

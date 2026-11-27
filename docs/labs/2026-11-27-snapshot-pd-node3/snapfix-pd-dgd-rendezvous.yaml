@@ -1,0 +1,461 @@
+apiVersion: nvidia.com/v1beta1
+kind: DynamoGraphDeployment
+metadata:
+  name: snapfix-pd
+  namespace: snapfix-lab
+spec:
+  backendFramework: vllm
+  env:
+  - name: HF_HOME
+    value: /data/hf
+  - name: HF_HUB_OFFLINE
+    value: '1'
+  - name: OTEL_EXPORT_ENABLED
+    value: 'true'
+  - name: DYN_LOGGING_JSONL
+    value: 'true'
+  - name: OTEL_EXPORTER_OTLP_PROTOCOL
+    value: http/protobuf
+  - name: OTEL_EXPORTER_OTLP_TRACES_PROTOCOL
+    value: http/protobuf
+  - name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+    value: http://victoria-traces.victoria-stack.svc.cluster.local:10428/insert/opentelemetry/v1/traces
+  - name: OTEL_EXPORTER_OTLP_LOGS_ENDPOINT
+    value: http://victoria-logs.victoria-stack.svc.cluster.local:9428/insert/opentelemetry/v1/logs
+  - name: OTEL_TRACES_SAMPLE_RATIO
+    value: '1.0'
+  components:
+  - name: Frontend
+    podTemplate:
+      metadata: {}
+      spec:
+        containers:
+        - env:
+          - name: DYN_ROUTER_MODE
+            value: round-robin
+          - name: DYN_MIGRATION_LIMIT
+            value: '2'
+          - name: DYN_HTTP_GRACEFUL_SHUTDOWN_TIMEOUT_SECS
+            value: '90'
+          - name: DYN_TCP_MAX_MESSAGE_SIZE
+            value: '134217728'
+          - name: DYN_MM_MAX_DATA_URL_MB
+            value: '64'
+          - name: DYN_HTTP_BODY_LIMIT_MB
+            value: '64'
+          - name: OTEL_SERVICE_NAME
+            value: b300-gemma4-dpo-nvfp4fp8attn-p4d8-frontend
+          - name: TIME_DEPLOYMENT
+            value: v1.6.0-nightly-20261016-gemma4-hetero-tp.1-cu130
+          - name: DYN_METRICS_ISL_BUCKETS
+            value: 512,1024,2048,4096,8192,16384
+          image: 865626945255.dkr.ecr.ap-southeast-5.amazonaws.com/scicom/dynamo-vllm-runtime:v1.6.0-nightly-20261016-gemma4-hetero-tp.1-cu130
+          imagePullPolicy: IfNotPresent
+          name: main
+          volumeMounts:
+          - mountPath: /data/hf
+            name: hf-cache
+            readOnly: true
+        imagePullSecrets:
+        - name: regcred
+        terminationGracePeriodSeconds: 100
+        volumes:
+        - hostPath:
+            path: /data/hf
+            type: Directory
+          name: hf-cache
+        nodeSelector:
+          kubernetes.io/hostname: tm-ucc-c3ssfjix-0000
+    replicas: 1
+    runtimeVersionOverride: 1.5.0
+    type: frontend
+  - name: VllmPrefillWorker
+    podTemplate:
+      metadata:
+        annotations:
+          nvidia.com/deployment-rolling-update-max-surge: '0'
+          nvidia.com/deployment-rolling-update-max-unavailable: '1'
+          nvidia.com/use-gpuuuid: GPU-8a81b39c-ff3e-f36e-06e4-927977a0e1f7,GPU-979b4fa4-02a3-e0c5-726d-20ec73196cc5,GPU-9f664db9-bdac-5fdc-0bea-1dffdd229e08,GPU-23945d4b-4a48-4ea7-1551-4d10487f294e
+          nvidia.com/snapshot-multi-gpu: enabled
+          nvidia.com/snapshot-target-containers: main
+        labels:
+          nvidia.com/snapshot-checkpoint-id: snapfix-pd-prefill
+          nvidia.com/snapshot-is-checkpoint-source: 'true'
+          snapfix-pd/role: prefill
+      spec:
+        containers:
+        - args:
+          - --model
+          - /data/hf/swap/gemma4-31b-fp8/gemma-a
+          - --kv-cache-dtype
+          - auto
+          - --tensor-parallel-size
+          - '4'
+          - --max-model-len
+          - '4096'
+          - --gpu-memory-utilization
+          - '0.06'
+          - --block-size
+          - '64'
+          - --enable-multimodal
+          - --dyn-tool-call-parser
+          - gemma4
+          - --dyn-reasoning-parser
+          - gemma4
+          - --no-enable-prefix-caching
+          - --disable-hybrid-kv-cache-manager
+          - --structured-outputs-config
+          - '{"backend": "xgrammar", "disable_any_whitespace": true}'
+          - --kv-transfer-config
+          - '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'
+          - --disaggregation-mode
+          - prefill
+          - --max-num-batched-tokens
+          - '32768'
+          - --kv-events-config
+          - '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:20080","enable_kv_cache_events":true}'
+          - --served-model-name
+          - Scicom-intl/gemma-4-31B-it-dpo-repetition-v3.3-handover-v20a-2026-10-27-NVFP4-FP8-attn
+          command:
+          - /tmp/snapshot-cuda/cuinterpose-launch
+          - --library
+          - /tmp/snapshot-cuda/libcuinterpose.so
+          - --
+          - python3
+          - -m
+          - dynamo.vllm
+          env:
+          - name: MODEL
+            value: Scicom-intl/gemma-4-31B-it-dpo-repetition-v3.3-handover-v20a-2026-10-27-NVFP4-FP8-attn
+          - name: OTEL_SERVICE_NAME
+            value: b300-gemma4-dpo-nvfp4fp8attn-p4d8-prefill
+          - name: DYN_SYSTEM_PORT
+            value: '9090'
+          - name: DYN_FORWARDPASS_METRIC_PORT
+            value: '20380'
+          - name: VLLM_NIXL_SIDE_CHANNEL_PORT
+            value: '5600'
+          - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+            valueFrom:
+              fieldRef:
+                fieldPath: status.hostIP
+          - name: CUDA_DISABLE_CONTROL
+            value: 'true'
+          - name: DYN_RUNTIME_GRACEFUL_SHUTDOWN_TIMEOUT_SECS
+            value: '90'
+          - name: DYN_TCP_MAX_MESSAGE_SIZE
+            value: '134217728'
+          - name: DYN_MM_MAX_DATA_URL_MB
+            value: '64'
+          - name: VLLM_USE_DEEP_GEMM
+            value: '0'
+          - name: VLLM_OMNI_USE_QUACK_FP8
+            value: '0'
+          - name: PYTHONHASHSEED
+            value: '0'
+          - name: NCCL_NET_PLUGIN
+            value: none
+          - name: UCX_TLS
+            value: rc_x,cuda_copy,cuda_ipc
+          - name: UCX_NET_DEVICES
+            value: mlx5_bond_0:1,mlx5_bond_1:1,mlx5_bond_2:1,mlx5_bond_3:1,mlx5_bond_4:1,mlx5_bond_5:1,mlx5_bond_6:1,mlx5_bond_7:1
+          - name: UCX_IB_ADDR_TYPE
+            value: eth
+          - name: UCX_IB_GID_INDEX
+            value: '3'
+          - name: UCX_RNDV_SCHEME
+            value: get_zcopy
+          - name: UCX_RNDV_THRESH
+            value: '0'
+          - name: SNAPSHOT_CONTROL_DIR
+            value: /snapshot-control
+          - name: DYN_SNAPSHOT_CONTROL_DIR
+            value: /snapshot-control
+          - name: LD_LIBRARY_PATH
+            value: /cuda-compat:/usr/local/lib
+          - name: VLLM_ENGINE_ITERATION_TIMEOUT_S
+            value: "600"
+          - name: VLLM_PORT
+            value: "29500"
+          - name: MASTER_PORT
+            value: "29500"
+          - name: VLLM_HOST_IP
+            value: "10.0.11.1"
+          image: localhost/snapfix/dynamo-vllm-placeholder:v1.6.0-cu130
+          imagePullPolicy: IfNotPresent
+          livenessProbe:
+            failureThreshold: 12
+            httpGet:
+              path: /live
+              port: system
+            periodSeconds: 10
+            timeoutSeconds: 5
+          name: main
+          ports:
+          - containerPort: 9090
+            name: system
+            protocol: TCP
+          - containerPort: 19090
+            name: nixl
+            protocol: TCP
+          resources:
+            limits:
+              nvidia.com/gpu: '4'
+              nvidia.com/gpumem-percentage: '6'
+              rdma/rdma_shared_device_a: '1'
+          securityContext:
+            capabilities:
+              add:
+              - IPC_LOCK
+            runAsUser: 0
+          volumeMounts:
+          - mountPath: /data/hf
+            name: hf-cache
+          - name: snapshot-control
+            mountPath: /snapshot-control
+            subPath: main
+          - name: cuda-compat
+            mountPath: /cuda-compat
+            readOnly: true
+          - name: snapshot-cuda
+            mountPath: /tmp/snapshot-cuda
+            readOnly: true
+        dnsPolicy: ClusterFirstWithHostNet
+        hostNetwork: true
+        imagePullSecrets:
+        - name: regcred
+        initContainers:
+        - name: snapshot-cuda-install
+          image: ghcr.io/ai-dynamo/snapshot/agent:v0.3.0
+          imagePullPolicy: IfNotPresent
+          command:
+          - /bin/cp
+          args:
+          - --preserve=mode
+          - --
+          - /usr/local/lib/snapshot/libcuinterpose.so
+          - /usr/local/lib/snapshot/libcuinterpose_core.so
+          - /usr/local/bin/cuinterpose-launch
+          - /tmp/snapshot-cuda/
+          volumeMounts:
+          - name: snapshot-cuda
+            mountPath: /tmp/snapshot-cuda
+        nodeSelector:
+          kubernetes.io/hostname: tm-ucc-c3ssfjix-0000
+        runtimeClassName: nvidia
+        terminationGracePeriodSeconds: 100
+        volumes:
+        - hostPath:
+            path: /data/hf
+            type: Directory
+          name: hf-cache
+        - name: snapshot-control
+          emptyDir: {}
+        - name: cuda-compat
+          hostPath:
+            path: /data/snapfix/cuda-compat
+            type: Directory
+        - name: snapshot-cuda
+          emptyDir: {}
+        securityContext:
+          seccompProfile:
+            type: Localhost
+            localhostProfile: profiles/block-iouring.json
+    replicas: 1
+    runtimeVersionOverride: 1.5.0
+    sharedMemorySize: 16Gi
+    type: prefill
+  - name: VllmDecodeWorker
+    podTemplate:
+      metadata:
+        annotations:
+          nvidia.com/deployment-rolling-update-max-surge: '0'
+          nvidia.com/deployment-rolling-update-max-unavailable: '1'
+          nvidia.com/use-gpuuuid: GPU-ef862efe-db18-8a9b-1b54-b64aa4a097db,GPU-576801ce-a8ee-703f-d940-8df565142c7b,GPU-63832da7-df65-adbd-c1cf-3d82188f3a99,GPU-0b09f3ae-9def-efd5-48d2-f45c25fbd4ea
+          nvidia.com/snapshot-multi-gpu: enabled
+          nvidia.com/snapshot-target-containers: main
+        labels:
+          nvidia.com/snapshot-checkpoint-id: snapfix-pd-decode
+          nvidia.com/snapshot-is-checkpoint-source: 'true'
+          snapfix-pd/role: decode
+      spec:
+        containers:
+        - args:
+          - --model
+          - /data/hf/swap/gemma4-31b-fp8/gemma-a
+          - --kv-cache-dtype
+          - auto
+          - --tensor-parallel-size
+          - '4'
+          - --max-model-len
+          - '4096'
+          - --gpu-memory-utilization
+          - '0.06'
+          - --block-size
+          - '64'
+          - --enable-multimodal
+          - --dyn-tool-call-parser
+          - gemma4
+          - --dyn-reasoning-parser
+          - gemma4
+          - --no-enable-prefix-caching
+          - --disable-hybrid-kv-cache-manager
+          - --structured-outputs-config
+          - '{"backend": "xgrammar", "disable_any_whitespace": true}'
+          - --kv-transfer-config
+          - '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'
+          - --disaggregation-mode
+          - decode
+          - --max-num-batched-tokens
+          - '4096'
+          - --served-model-name
+          - Scicom-intl/gemma-4-31B-it-dpo-repetition-v3.3-handover-v20a-2026-10-27-NVFP4-FP8-attn
+          command:
+          - /tmp/snapshot-cuda/cuinterpose-launch
+          - --library
+          - /tmp/snapshot-cuda/libcuinterpose.so
+          - --
+          - python3
+          - -m
+          - dynamo.vllm
+          env:
+          - name: MODEL
+            value: Scicom-intl/gemma-4-31B-it-dpo-repetition-v3.3-handover-v20a-2026-10-27-NVFP4-FP8-attn
+          - name: OTEL_SERVICE_NAME
+            value: b300-gemma4-dpo-nvfp4fp8attn-p4d8-decode
+          - name: DYN_SYSTEM_PORT
+            value: '9091'
+          - name: DYN_FORWARDPASS_METRIC_PORT
+            value: '20381'
+          - name: VLLM_NIXL_SIDE_CHANNEL_PORT
+            value: '5700'
+          - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+            valueFrom:
+              fieldRef:
+                fieldPath: status.hostIP
+          - name: CUDA_DISABLE_CONTROL
+            value: 'true'
+          - name: DYN_RUNTIME_GRACEFUL_SHUTDOWN_TIMEOUT_SECS
+            value: '90'
+          - name: DYN_TCP_MAX_MESSAGE_SIZE
+            value: '134217728'
+          - name: DYN_MM_MAX_DATA_URL_MB
+            value: '64'
+          - name: VLLM_USE_DEEP_GEMM
+            value: '0'
+          - name: VLLM_OMNI_USE_QUACK_FP8
+            value: '0'
+          - name: PYTHONHASHSEED
+            value: '0'
+          - name: NCCL_NET_PLUGIN
+            value: none
+          - name: UCX_TLS
+            value: rc_x,cuda_copy,cuda_ipc
+          - name: UCX_NET_DEVICES
+            value: mlx5_bond_0:1,mlx5_bond_1:1,mlx5_bond_2:1,mlx5_bond_3:1,mlx5_bond_4:1,mlx5_bond_5:1,mlx5_bond_6:1,mlx5_bond_7:1
+          - name: UCX_IB_ADDR_TYPE
+            value: eth
+          - name: UCX_IB_GID_INDEX
+            value: '3'
+          - name: UCX_RNDV_SCHEME
+            value: get_zcopy
+          - name: UCX_RNDV_THRESH
+            value: '0'
+          - name: SNAPSHOT_CONTROL_DIR
+            value: /snapshot-control
+          - name: DYN_SNAPSHOT_CONTROL_DIR
+            value: /snapshot-control
+          - name: LD_LIBRARY_PATH
+            value: /cuda-compat:/usr/local/lib
+          - name: VLLM_ENGINE_ITERATION_TIMEOUT_S
+            value: "600"
+          - name: VLLM_PORT
+            value: "29500"
+          - name: MASTER_PORT
+            value: "29500"
+          - name: VLLM_HOST_IP
+            value: "10.0.11.1"
+          image: localhost/snapfix/dynamo-vllm-placeholder:v1.6.0-cu130
+          imagePullPolicy: IfNotPresent
+          livenessProbe:
+            failureThreshold: 12
+            httpGet:
+              path: /live
+              port: system
+            periodSeconds: 10
+            timeoutSeconds: 5
+          name: main
+          ports:
+          - containerPort: 9091
+            name: system
+            protocol: TCP
+          - containerPort: 19091
+            name: nixl
+            protocol: TCP
+          resources:
+            limits:
+              nvidia.com/gpu: '4'
+              nvidia.com/gpumem-percentage: '6'
+              rdma/rdma_shared_device_a: '1'
+          securityContext:
+            capabilities:
+              add:
+              - IPC_LOCK
+            runAsUser: 0
+          volumeMounts:
+          - mountPath: /data/hf
+            name: hf-cache
+          - name: snapshot-control
+            mountPath: /snapshot-control
+            subPath: main
+          - name: cuda-compat
+            mountPath: /cuda-compat
+            readOnly: true
+          - name: snapshot-cuda
+            mountPath: /tmp/snapshot-cuda
+            readOnly: true
+        dnsPolicy: ClusterFirstWithHostNet
+        hostNetwork: true
+        imagePullSecrets:
+        - name: regcred
+        initContainers:
+        - name: snapshot-cuda-install
+          image: ghcr.io/ai-dynamo/snapshot/agent:v0.3.0
+          imagePullPolicy: IfNotPresent
+          command:
+          - /bin/cp
+          args:
+          - --preserve=mode
+          - --
+          - /usr/local/lib/snapshot/libcuinterpose.so
+          - /usr/local/lib/snapshot/libcuinterpose_core.so
+          - /usr/local/bin/cuinterpose-launch
+          - /tmp/snapshot-cuda/
+          volumeMounts:
+          - name: snapshot-cuda
+            mountPath: /tmp/snapshot-cuda
+        nodeSelector:
+          kubernetes.io/hostname: tm-ucc-c3ssfjix-0000
+        runtimeClassName: nvidia
+        terminationGracePeriodSeconds: 100
+        volumes:
+        - hostPath:
+            path: /data/hf
+            type: Directory
+          name: hf-cache
+        - name: snapshot-control
+          emptyDir: {}
+        - name: cuda-compat
+          hostPath:
+            path: /data/snapfix/cuda-compat
+            type: Directory
+        - name: snapshot-cuda
+          emptyDir: {}
+        securityContext:
+          seccompProfile:
+            type: Localhost
+            localhostProfile: profiles/block-iouring.json
+    replicas: 1
+    runtimeVersionOverride: 1.5.0
+    sharedMemorySize: 16Gi
+    type: decode
