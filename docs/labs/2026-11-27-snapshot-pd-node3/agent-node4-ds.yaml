@@ -1,0 +1,445 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+{
+  "apiVersion": "apps/v1",
+  "kind": "DaemonSet",
+  "metadata": {
+    "labels": {
+      "app.kubernetes.io/component": "snapshot-agent",
+      "app.kubernetes.io/instance": "lab-snap",
+      "app.kubernetes.io/managed-by": "Helm",
+      "app.kubernetes.io/name": "snapshot",
+      "app.kubernetes.io/version": "v0.3.0",
+      "helm.sh/chart": "snapshot-0.3.0"
+    },
+    "name": "lab-snap-snapshot-agent-n4",
+    "namespace": "snapfix-lab"
+  },
+  "spec": {
+    "revisionHistoryLimit": 10,
+    "selector": {
+      "matchLabels": {
+        "app.kubernetes.io/component": "snapshot-agent",
+        "app.kubernetes.io/instance": "lab-snap-n4",
+        "app.kubernetes.io/name": "snapshot"
+      }
+    },
+    "template": {
+      "metadata": {
+        "annotations": {},
+        "labels": {
+          "app.kubernetes.io/component": "snapshot-agent",
+          "app.kubernetes.io/instance": "lab-snap-n4",
+          "app.kubernetes.io/name": "snapshot"
+        }
+      },
+      "spec": {
+        "affinity": {
+          "nodeAffinity": {
+            "requiredDuringSchedulingIgnoredDuringExecution": {
+              "nodeSelectorTerms": [
+                {
+                  "matchExpressions": [
+                    {
+                      "key": "kubernetes.io/arch",
+                      "operator": "In",
+                      "values": [
+                        "amd64",
+                        "arm64"
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        "containers": [
+          {
+            "args": [
+              "--runtime",
+              "containerd",
+              "--runtime-socket",
+              "/run/k3s/containerd/containerd.sock"
+            ],
+            "env": [
+              {
+                "name": "LD_LIBRARY_PATH",
+                "value": "/cuda-compat:/usr/local/lib"
+              },
+              {
+                "name": "NODE_NAME",
+                "valueFrom": {
+                  "fieldRef": {
+                    "apiVersion": "v1",
+                    "fieldPath": "spec.nodeName"
+                  }
+                }
+              },
+              {
+                "name": "SNAPSHOT_LOG_LEVEL",
+                "value": "info"
+              },
+              {
+                "name": "NVIDIA_VISIBLE_DEVICES",
+                "value": "all"
+              },
+              {
+                "name": "NVIDIA_DRIVER_CAPABILITIES",
+                "value": "compute,utility"
+              }
+            ],
+            "image": "ghcr.io/ai-dynamo/snapshot/agent:v0.3.0",
+            "imagePullPolicy": "Always",
+            "name": "agent",
+            "resources": {
+              "limits": {
+                "cpu": "8",
+                "memory": "192Gi"
+              },
+              "requests": {
+                "cpu": "2",
+                "memory": "1Gi"
+              }
+            },
+            "securityContext": {
+              "privileged": true
+            },
+            "terminationMessagePath": "/dev/termination-log",
+            "terminationMessagePolicy": "File",
+            "volumeMounts": [
+              {
+                "mountPath": "/cuda-compat",
+                "name": "cuda-compat",
+                "readOnly": true
+              },
+              {
+                "mountPath": "/usr/local/lib/criu",
+                "name": "criu-default-plugins",
+                "readOnly": true
+              },
+              {
+                "mountPath": "/criu-plugins",
+                "name": "criu-plugins",
+                "readOnly": true
+              },
+              {
+                "mountPath": "/etc/snapshot",
+                "name": "config",
+                "readOnly": true
+              },
+              {
+                "mountPath": "/pagebroker",
+                "name": "pagebroker"
+              },
+              {
+                "mountPath": "/checkpoints",
+                "name": "checkpoints"
+              },
+              {
+                "mountPath": "/run/k3s/containerd",
+                "name": "runtime-run"
+              },
+              {
+                "mountPath": "/var/lib/kubelet/pods",
+                "name": "kubelet-pods",
+                "readOnly": true
+              },
+              {
+                "mountPath": "/var/run/nri",
+                "name": "nri"
+              },
+              {
+                "mountPath": "/sys/kernel/security",
+                "name": "securityfs",
+                "readOnly": true
+              },
+              {
+                "mountPath": "/var/lib/rancher/k3s/agent/containerd",
+                "name": "runtime-storage",
+                "readOnly": true
+              },
+              {
+                "mountPath": "/host/proc",
+                "name": "host-proc"
+              },
+              {
+                "mountPath": "/sys/fs/cgroup",
+                "name": "host-cgroup"
+              },
+              {
+                "mountPath": "/var/lib/kubelet/pod-resources",
+                "name": "kubelet-pod-resources",
+                "readOnly": true
+              }
+            ]
+          },
+          {
+            "args": [
+              "/pagebroker/control/pagebroker.sock",
+              "/pagebroker/staging",
+              "/checkpoints",
+              "--max-concurrent-requests",
+              "16",
+              "--custom-storage-buffer-count",
+              "32",
+              "--custom-storage-chunk-bytes",
+              "134217728",
+              "--custom-storage-max-pinned-bytes",
+              "0"
+            ],
+            "env": [
+              {
+                "name": "NVIDIA_VISIBLE_DEVICES",
+                "value": "all"
+              },
+              {
+                "name": "NVIDIA_DRIVER_CAPABILITIES",
+                "value": "compute,utility"
+              }
+            ],
+            "image": "ghcr.io/ai-dynamo/snapshot/pagebroker:v0.3.0",
+            "imagePullPolicy": "Always",
+            "name": "pagebroker",
+            "resources": {
+              "limits": {
+                "cpu": "32",
+                "memory": "256Gi"
+              },
+              "requests": {
+                "cpu": "8",
+                "memory": "32Gi"
+              }
+            },
+            "securityContext": {
+              "privileged": true,
+              "runAsGroup": 0,
+              "runAsUser": 0
+            },
+            "terminationMessagePath": "/dev/termination-log",
+            "terminationMessagePolicy": "File",
+            "volumeMounts": [
+              {
+                "mountPath": "/etc/snapshot",
+                "name": "storage-config",
+                "readOnly": true
+              },
+              {
+                "mountPath": "/pagebroker",
+                "name": "pagebroker"
+              },
+              {
+                "mountPath": "/checkpoints",
+                "name": "checkpoints"
+              }
+            ]
+          }
+        ],
+        "dnsPolicy": "ClusterFirst",
+        "hostIPC": true,
+        "hostNetwork": true,
+        "hostPID": true,
+        "initContainers": [
+          {
+            "command": [
+              "sh",
+              "-c",
+              "mkdir -p /host-seccomp/profiles\ncp /seccomp-profiles/block-iouring.json /host-seccomp/profiles/block-iouring.json\necho \"Deployed seccomp profile to /var/lib/kubelet/seccomp/profiles/block-iouring.json\"\n"
+            ],
+            "image": "busybox:1.37.0@sha256:9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0",
+            "imagePullPolicy": "IfNotPresent",
+            "name": "deploy-seccomp",
+            "resources": {
+              "limits": {
+                "cpu": "100m",
+                "memory": "64Mi"
+              },
+              "requests": {
+                "cpu": "10m",
+                "memory": "16Mi"
+              }
+            },
+            "terminationMessagePath": "/dev/termination-log",
+            "terminationMessagePolicy": "File",
+            "volumeMounts": [
+              {
+                "mountPath": "/seccomp-profiles",
+                "name": "seccomp-profiles",
+                "readOnly": true
+              },
+              {
+                "mountPath": "/host-seccomp",
+                "name": "host-seccomp"
+              }
+            ]
+          }
+        ],
+        "nodeSelector": {
+          "kubernetes.io/hostname": "tm-ucc-hpfsset5-0001",
+          "nvidia.com/gpu.present": "true"
+        },
+        "restartPolicy": "Always",
+        "runtimeClassName": "nvidia",
+        "schedulerName": "default-scheduler",
+        "securityContext": {},
+        "serviceAccount": "lab-snap-snapshot",
+        "serviceAccountName": "lab-snap-snapshot",
+        "terminationGracePeriodSeconds": 30,
+        "tolerations": [
+          {
+            "operator": "Exists"
+          },
+          {
+            "effect": "NoSchedule",
+            "key": "nvidia.com/gpu",
+            "operator": "Exists"
+          },
+          {
+            "effect": "NoSchedule",
+            "key": "dedicated",
+            "operator": "Exists"
+          }
+        ],
+        "volumes": [
+          {
+            "hostPath": {
+              "path": "/data/snapfix/cuda-compat",
+              "type": "Directory"
+            },
+            "name": "cuda-compat"
+          },
+          {
+            "hostPath": {
+              "path": "/data/snapfix/criu-plugins",
+              "type": "Directory"
+            },
+            "name": "criu-default-plugins"
+          },
+          {
+            "hostPath": {
+              "path": "/data/snapfix/criu-plugins",
+              "type": "Directory"
+            },
+            "name": "criu-plugins"
+          },
+          {
+            "configMap": {
+              "defaultMode": 420,
+              "items": [
+                {
+                  "key": "config.yaml",
+                  "path": "config.yaml"
+                }
+              ],
+              "name": "lab-snap-snapshot-config"
+            },
+            "name": "config"
+          },
+          {
+            "configMap": {
+              "defaultMode": 420,
+              "items": [
+                {
+                  "key": "storage.yaml",
+                  "path": "storage.yaml"
+                }
+              ],
+              "name": "lab-snap-snapshot-config"
+            },
+            "name": "storage-config"
+          },
+          {
+            "emptyDir": {
+              "medium": "Memory",
+              "sizeLimit": "197568495616"
+            },
+            "name": "pagebroker"
+          },
+          {
+            "configMap": {
+              "defaultMode": 420,
+              "name": "lab-snap-snapshot-seccomp"
+            },
+            "name": "seccomp-profiles"
+          },
+          {
+            "hostPath": {
+              "path": "/var/lib/kubelet/seccomp",
+              "type": "DirectoryOrCreate"
+            },
+            "name": "host-seccomp"
+          },
+          {
+            "name": "checkpoints",
+            "persistentVolumeClaim": {
+              "claimName": "snapfix-pd-pvc"
+            }
+          },
+          {
+            "hostPath": {
+              "path": "/run/k3s/containerd",
+              "type": "Directory"
+            },
+            "name": "runtime-run"
+          },
+          {
+            "hostPath": {
+              "path": "/var/lib/kubelet/pods",
+              "type": "Directory"
+            },
+            "name": "kubelet-pods"
+          },
+          {
+            "hostPath": {
+              "path": "/var/run/nri",
+              "type": "DirectoryOrCreate"
+            },
+            "name": "nri"
+          },
+          {
+            "hostPath": {
+              "path": "/sys/kernel/security",
+              "type": "Directory"
+            },
+            "name": "securityfs"
+          },
+          {
+            "hostPath": {
+              "path": "/var/lib/rancher/k3s/agent/containerd",
+              "type": "Directory"
+            },
+            "name": "runtime-storage"
+          },
+          {
+            "hostPath": {
+              "path": "/proc",
+              "type": "Directory"
+            },
+            "name": "host-proc"
+          },
+          {
+            "hostPath": {
+              "path": "/sys/fs/cgroup",
+              "type": "Directory"
+            },
+            "name": "host-cgroup"
+          },
+          {
+            "hostPath": {
+              "path": "/var/lib/kubelet/pod-resources",
+              "type": "Directory"
+            },
+            "name": "kubelet-pod-resources"
+          }
+        ]
+      }
+    },
+    "updateStrategy": {
+      "rollingUpdate": {
+        "maxSurge": 0,
+        "maxUnavailable": 1
+      },
+      "type": "RollingUpdate"
+    }
+  }
+}

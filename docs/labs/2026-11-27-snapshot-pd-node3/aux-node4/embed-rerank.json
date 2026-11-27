@@ -1,0 +1,481 @@
+{
+  "apiVersion": "v1",
+  "kind": "List",
+  "items": [
+    {
+      "apiVersion": "apps/v1",
+      "kind": "Deployment",
+      "metadata": {
+        "annotations": {},
+        "labels": {
+          "app": "jina-reranker-v35"
+        },
+        "name": "jina-reranker-v35",
+        "namespace": "embed-rerank"
+      },
+      "spec": {
+        "progressDeadlineSeconds": 600,
+        "replicas": 1,
+        "revisionHistoryLimit": 10,
+        "selector": {
+          "matchLabels": {
+            "app": "jina-reranker-v35"
+          }
+        },
+        "strategy": {
+          "type": "Recreate"
+        },
+        "template": {
+          "metadata": {
+            "annotations": {
+              "nvidia.com/use-gpuuuid": "GPU-739fa9f5-e667-8a97-543d-362860a5c227"
+            },
+            "labels": {
+              "app": "jina-reranker-v35"
+            }
+          },
+          "spec": {
+            "containers": [
+              {
+                "args": [
+                  "jinaai/jina-reranker-v3.5",
+                  "--revision",
+                  "e8a93f33f0b22108f8c2364f8484ce3422552fbc",
+                  "--runner",
+                  "pooling",
+                  "--served-model-name",
+                  "jina-reranker-v3.5",
+                  "--tensor-parallel-size",
+                  "1",
+                  "--max-model-len",
+                  "131072",
+                  "--max-num-batched-tokens",
+                  "65536",
+                  "--gpu-memory-utilization",
+                  "0.85",
+                  "--host",
+                  "0.0.0.0",
+                  "--port",
+                  "8000"
+                ],
+                "command": [
+                  "/bin/sh",
+                  "/fork/start.sh"
+                ],
+                "env": [
+                  {
+                    "name": "CUDA_DISABLE_CONTROL",
+                    "value": "true"
+                  },
+                  {
+                    "name": "HF_HOME",
+                    "value": "/data/hf"
+                  },
+                  {
+                    "name": "HF_HUB_OFFLINE",
+                    "value": "1"
+                  }
+                ],
+                "image": "865626945255.dkr.ecr.ap-southeast-5.amazonaws.com/scicom/dynamo-vllm-runtime:v1.6.0-nightly-20261016-gemma4-hetero-tp.1-cu130",
+                "imagePullPolicy": "IfNotPresent",
+                "livenessProbe": {
+                  "failureThreshold": 6,
+                  "httpGet": {
+                    "path": "/health",
+                    "port": "http",
+                    "scheme": "HTTP"
+                  },
+                  "periodSeconds": 10,
+                  "successThreshold": 1,
+                  "timeoutSeconds": 1
+                },
+                "name": "vllm",
+                "ports": [
+                  {
+                    "containerPort": 8000,
+                    "name": "http",
+                    "protocol": "TCP"
+                  }
+                ],
+                "readinessProbe": {
+                  "failureThreshold": 3,
+                  "httpGet": {
+                    "path": "/health",
+                    "port": "http",
+                    "scheme": "HTTP"
+                  },
+                  "periodSeconds": 10,
+                  "successThreshold": 1,
+                  "timeoutSeconds": 1
+                },
+                "resources": {
+                  "limits": {
+                    "memory": "64Gi",
+                    "nvidia.com/gpu": "1",
+                    "nvidia.com/gpumem-percentage": "85"
+                  },
+                  "requests": {
+                    "cpu": "4",
+                    "memory": "32Gi"
+                  }
+                },
+                "startupProbe": {
+                  "failureThreshold": 90,
+                  "httpGet": {
+                    "path": "/health",
+                    "port": "http",
+                    "scheme": "HTTP"
+                  },
+                  "periodSeconds": 10,
+                  "successThreshold": 1,
+                  "timeoutSeconds": 1
+                },
+                "terminationMessagePath": "/dev/termination-log",
+                "terminationMessagePolicy": "File",
+                "volumeMounts": [
+                  {
+                    "mountPath": "/data/hf",
+                    "name": "hf-cache",
+                    "readOnly": true
+                  },
+                  {
+                    "mountPath": "/fork",
+                    "name": "vllm-fork",
+                    "readOnly": true
+                  },
+                  {
+                    "mountPath": "/dev/shm",
+                    "name": "shm"
+                  }
+                ]
+              }
+            ],
+            "dnsPolicy": "ClusterFirst",
+            "enableServiceLinks": false,
+            "imagePullSecrets": [
+              {
+                "name": "regcred"
+              }
+            ],
+            "initContainers": [
+              {
+                "command": [
+                  "python3",
+                  "-c",
+                  "import time, urllib.request\nurl = \"http://qwen3-embedding-8b.embed-rerank.svc.cluster.local:8000/health\"\nfor _ in range(90):\n    try:\n        urllib.request.urlopen(url, timeout=5)\n        print(\"embedding engine healthy\"); break\n    except Exception:\n        time.sleep(10)\nelse:\n    print(\"embedding engine not healthy after 15 min, starting anyway\")\n"
+                ],
+                "env": [
+                  {
+                    "name": "NVIDIA_VISIBLE_DEVICES",
+                    "value": "void"
+                  }
+                ],
+                "image": "865626945255.dkr.ecr.ap-southeast-5.amazonaws.com/scicom/dynamo-vllm-runtime:v1.6.0-nightly-20261016-gemma4-hetero-tp.1-cu130",
+                "imagePullPolicy": "IfNotPresent",
+                "name": "wait-embedding",
+                "resources": {},
+                "terminationMessagePath": "/dev/termination-log",
+                "terminationMessagePolicy": "File"
+              }
+            ],
+            "nodeSelector": {
+              "kubernetes.io/hostname": "tm-ucc-hpfsset5-0001"
+            },
+            "restartPolicy": "Always",
+            "runtimeClassName": "nvidia",
+            "schedulerName": "default-scheduler",
+            "securityContext": {},
+            "terminationGracePeriodSeconds": 60,
+            "volumes": [
+              {
+                "hostPath": {
+                  "path": "/data/hf",
+                  "type": "Directory"
+                },
+                "name": "hf-cache"
+              },
+              {
+                "configMap": {
+                  "defaultMode": 420,
+                  "name": "vllm-fork"
+                },
+                "name": "vllm-fork"
+              },
+              {
+                "emptyDir": {
+                  "medium": "Memory",
+                  "sizeLimit": "16Gi"
+                },
+                "name": "shm"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "apiVersion": "apps/v1",
+      "kind": "Deployment",
+      "metadata": {
+        "annotations": {},
+        "labels": {
+          "app": "qwen3-embedding-8b"
+        },
+        "name": "qwen3-embedding-8b",
+        "namespace": "embed-rerank"
+      },
+      "spec": {
+        "progressDeadlineSeconds": 600,
+        "replicas": 1,
+        "revisionHistoryLimit": 10,
+        "selector": {
+          "matchLabels": {
+            "app": "qwen3-embedding-8b"
+          }
+        },
+        "strategy": {
+          "type": "Recreate"
+        },
+        "template": {
+          "metadata": {
+            "annotations": {
+              "nvidia.com/use-gpuuuid": "GPU-1a3cfdbe-ec99-012f-094d-102c67ac0af6"
+            },
+            "labels": {
+              "app": "qwen3-embedding-8b"
+            }
+          },
+          "spec": {
+            "containers": [
+              {
+                "args": [
+                  "Qwen/Qwen3-Embedding-8B",
+                  "--runner",
+                  "pooling",
+                  "--tensor-parallel-size",
+                  "1",
+                  "--gpu-memory-utilization",
+                  "0.85",
+                  "--host",
+                  "0.0.0.0",
+                  "--port",
+                  "8000"
+                ],
+                "command": [
+                  "vllm",
+                  "serve"
+                ],
+                "env": [
+                  {
+                    "name": "CUDA_DISABLE_CONTROL",
+                    "value": "true"
+                  },
+                  {
+                    "name": "HF_HOME",
+                    "value": "/data/hf"
+                  },
+                  {
+                    "name": "HF_HUB_OFFLINE",
+                    "value": "1"
+                  }
+                ],
+                "image": "865626945255.dkr.ecr.ap-southeast-5.amazonaws.com/scicom/dynamo-vllm-runtime:v1.6.0-nightly-20261016-gemma4-hetero-tp.1-cu130",
+                "imagePullPolicy": "IfNotPresent",
+                "livenessProbe": {
+                  "failureThreshold": 6,
+                  "httpGet": {
+                    "path": "/health",
+                    "port": "http",
+                    "scheme": "HTTP"
+                  },
+                  "periodSeconds": 10,
+                  "successThreshold": 1,
+                  "timeoutSeconds": 1
+                },
+                "name": "vllm",
+                "ports": [
+                  {
+                    "containerPort": 8000,
+                    "name": "http",
+                    "protocol": "TCP"
+                  }
+                ],
+                "readinessProbe": {
+                  "failureThreshold": 3,
+                  "httpGet": {
+                    "path": "/health",
+                    "port": "http",
+                    "scheme": "HTTP"
+                  },
+                  "periodSeconds": 10,
+                  "successThreshold": 1,
+                  "timeoutSeconds": 1
+                },
+                "resources": {
+                  "limits": {
+                    "memory": "128Gi",
+                    "nvidia.com/gpu": "1",
+                    "nvidia.com/gpumem-percentage": "85"
+                  },
+                  "requests": {
+                    "cpu": "4",
+                    "memory": "32Gi"
+                  }
+                },
+                "startupProbe": {
+                  "failureThreshold": 90,
+                  "httpGet": {
+                    "path": "/health",
+                    "port": "http",
+                    "scheme": "HTTP"
+                  },
+                  "periodSeconds": 10,
+                  "successThreshold": 1,
+                  "timeoutSeconds": 1
+                },
+                "terminationMessagePath": "/dev/termination-log",
+                "terminationMessagePolicy": "File",
+                "volumeMounts": [
+                  {
+                    "mountPath": "/data/hf",
+                    "name": "hf-cache",
+                    "readOnly": true
+                  },
+                  {
+                    "mountPath": "/dev/shm",
+                    "name": "shm"
+                  }
+                ]
+              }
+            ],
+            "dnsPolicy": "ClusterFirst",
+            "enableServiceLinks": false,
+            "imagePullSecrets": [
+              {
+                "name": "regcred"
+              }
+            ],
+            "nodeSelector": {
+              "kubernetes.io/hostname": "tm-ucc-hpfsset5-0001"
+            },
+            "restartPolicy": "Always",
+            "runtimeClassName": "nvidia",
+            "schedulerName": "default-scheduler",
+            "securityContext": {},
+            "terminationGracePeriodSeconds": 60,
+            "volumes": [
+              {
+                "hostPath": {
+                  "path": "/data/hf",
+                  "type": "Directory"
+                },
+                "name": "hf-cache"
+              },
+              {
+                "emptyDir": {
+                  "medium": "Memory",
+                  "sizeLimit": "16Gi"
+                },
+                "name": "shm"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "Service",
+      "metadata": {
+        "annotations": {},
+        "labels": {
+          "app": "jina-reranker-v35"
+        },
+        "name": "jina-reranker-v35",
+        "namespace": "embed-rerank"
+      },
+      "spec": {
+        "clusterIP": "10.45.170.6",
+        "clusterIPs": [
+          "10.45.170.6"
+        ],
+        "internalTrafficPolicy": "Cluster",
+        "ipFamilies": [
+          "IPv4"
+        ],
+        "ipFamilyPolicy": "SingleStack",
+        "ports": [
+          {
+            "name": "http",
+            "port": 8000,
+            "protocol": "TCP",
+            "targetPort": "http"
+          }
+        ],
+        "selector": {
+          "app": "jina-reranker-v35"
+        },
+        "sessionAffinity": "None",
+        "type": "ClusterIP"
+      }
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "Service",
+      "metadata": {
+        "annotations": {},
+        "labels": {
+          "app": "qwen3-embedding-8b"
+        },
+        "name": "qwen3-embedding-8b",
+        "namespace": "embed-rerank"
+      },
+      "spec": {
+        "clusterIP": "10.45.60.24",
+        "clusterIPs": [
+          "10.45.60.24"
+        ],
+        "internalTrafficPolicy": "Cluster",
+        "ipFamilies": [
+          "IPv4"
+        ],
+        "ipFamilyPolicy": "SingleStack",
+        "ports": [
+          {
+            "name": "http",
+            "port": 8000,
+            "protocol": "TCP",
+            "targetPort": "http"
+          }
+        ],
+        "selector": {
+          "app": "qwen3-embedding-8b"
+        },
+        "sessionAffinity": "None",
+        "type": "ClusterIP"
+      }
+    },
+    {
+      "apiVersion": "v1",
+      "data": {
+        "fork.patch": "commit 5cca3d347116312b3dd0dc53ea3862c39932a7a7\nAuthor: ariffnazhan-scicom <ariff.asri@scicom.com.my>\nDate:   Tue Oct 13 14:01:39 2026 +0800\n\n    feat(models): support jina-reranker-v3.5 interleaved sliding-window layers\n    \n    jina-reranker-v3.5 is jina-reranker-v3 with 16 of its 28 Qwen3 layers\n    restricted to a 1024-token sliding window (config.layer_types). Qwen2Model\n    built every layer as full attention, so the engine loaded the model and\n    returned scores that drift from the transformers reference once a prompt\n    is longer than the window.\n    \n    Qwen2Model now passes per_layer_sliding_window to the layers that\n    layer_types marks as sliding_attention. Decoder layer types that do not\n    take the argument raise instead of silently ignoring the window.\n    \n    Measured on one H20 against model.rerank() from transformers, nine\n    rerank requests of 346 to 25,794 prompt tokens:\n    - v0.30.0: max score difference 0.072, top document differs in 1 of 9\n    - this change: max score difference 0.003, top document same in 9 of 9\n\ndiff --git a/vllm/model_executor/models/qwen2.py b/vllm/model_executor/models/qwen2.py\nindex 7513936ebb..43f467eb02 100644\n--- a/vllm/model_executor/models/qwen2.py\n+++ b/vllm/model_executor/models/qwen2.py\n@@ -25,6 +25,7 @@\n # limitations under the License.\n \"\"\"Inference-only Qwen2 model compatible with HuggingFace weights.\"\"\"\n \n+import inspect\n from collections.abc import Iterable\n from itertools import islice\n from typing import Any\n@@ -346,16 +347,32 @@ class Qwen2Model(nn.Module, EagleModelMixin):\n         cache_config = vllm_config.cache_config\n         quant_config = vllm_config.quant_config\n \n-        # TODO (@robertgshaw2): see if this can be moved out\n-        if len(set(getattr(config, \"layer_types\", []))) > 1:\n-            assert config.max_window_layers == config.num_hidden_layers, (\n-                \"Sliding window for some but all layers is not supported. \"\n-                \"This model uses sliding window but `max_window_layers` = {} \"\n-                \"is less than `num_hidden_layers` = {}. Please open an issue \"\n-                \"to discuss this feature.\".format(\n-                    config.max_window_layers,\n-                    config.num_hidden_layers,\n-                )\n+        # Models that interleave sliding-window and full-attention layers list the\n+        # kind of each layer in `layer_types` (e.g. jinaai/jina-reranker-v3.5).\n+        layer_types = getattr(config, \"layer_types\", None) or []\n+        interleaved = len(set(layer_types)) > 1\n+        if interleaved and (\n+            \"per_layer_sliding_window\"\n+            not in inspect.signature(decoder_layer_type).parameters\n+        ):\n+            raise ValueError(\n+                f\"{decoder_layer_type.__name__} does not support interleaved \"\n+                \"sliding-window and full-attention layers (`layer_types`).\"\n+            )\n+\n+        def make_layer(prefix: str) -> nn.Module:\n+            kwargs = {}\n+            if (\n+                interleaved\n+                and layer_types[extract_layer_index(prefix)] == \"sliding_attention\"\n+            ):\n+                kwargs[\"per_layer_sliding_window\"] = config.sliding_window\n+            return decoder_layer_type(\n+                config=config,\n+                cache_config=cache_config,\n+                quant_config=quant_config,\n+                prefix=prefix,\n+                **kwargs,\n             )\n \n         self.config = config\n@@ -378,12 +395,7 @@ class Qwen2Model(nn.Module, EagleModelMixin):\n \n         self.start_layer, self.end_layer, self.layers = make_layers(\n             config.num_hidden_layers,\n-            lambda prefix: decoder_layer_type(\n-                config=config,\n-                cache_config=cache_config,\n-                quant_config=quant_config,\n-                prefix=prefix,\n-            ),\n+            make_layer,\n             prefix=f\"{prefix}.layers\",\n         )\n \n",
+        "start.sh": "#!/bin/sh\n# Applies the fork commit to the image's stock vLLM 0.31.0, then starts the engine with the container's args.\n# Fails closed: anything but the stock file (sha before) or the fork's file (sha after) stops the container.\nset -eu\nSITE=/usr/local/lib/python3.12/dist-packages\nF=$SITE/vllm/model_executor/models/qwen2.py\nSTOCK=6684104ba6dc40325bb1f6e632ec90633fa83a7b95883bb2181e9dc0008c3e21\nFORK=f6abd358c816809e9d1ac44a6361c1f47478b247dccc740c11c53d594db93cec\nhave=$(sha256sum \"$F\" | cut -d' ' -f1)\nif [ \"$have\" = \"$STOCK\" ]; then\n  patch -p1 -d \"$SITE\" < /fork/fork.patch\n  have=$(sha256sum \"$F\" | cut -d' ' -f1)\nfi\nif [ \"$have\" != \"$FORK\" ]; then\n  echo \"qwen2.py sha256 $have is neither stock v0.31.0 nor the fork, refusing to start\" >&2\n  exit 1\nfi\necho \"vllm $(python3 -c 'import vllm; print(vllm.__version__)') + fork commit 5cca3d3471 (vllm-jina-reranker PR #1), qwen2.py sha256 $have\"\nnvidia-smi --query-gpu=index,uuid,memory.used,memory.total --format=csv || true\nexec vllm serve \"$@\"\n"
+      },
+      "kind": "ConfigMap",
+      "metadata": {
+        "annotations": {},
+        "name": "vllm-fork",
+        "namespace": "embed-rerank"
+      }
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "ServiceAccount",
+      "metadata": {
+        "name": "default",
+        "namespace": "embed-rerank",
+        "annotations": null
+      }
+    }
+  ]
+}

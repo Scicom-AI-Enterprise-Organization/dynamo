@@ -488,3 +488,39 @@ checked immediately before capture and again before the restore rollout. The
 captured source container restarts once after the checkpoint (the agent resumes
 it), so the DGD rollout left it stuck Terminating with two restarts; force
 deleting that pod freed the cards and the restore proceeded.
+
+## Cross-node: capture on B300 node-3, restore on L20D node-4 (2026-11-27)
+
+Node-4's aux stack (namespaces `aux-bench`, `embed-rerank`, `speech`,
+`mps-control`) was exported to `aux-node4/` and deleted so all eight cards were
+free. The cards returned to 0 MiB with zero compute processes and the node stayed
+`Ready`; the `wall-live` loopback rules were not present there.
+
+Node-4 needed its own snapshot agent: `agent-node4-ds.yaml` clones the node-3
+DaemonSet with the instance label `lab-snap-n4` and a node-4 nodeSelector. Two
+node-3-only hostPaths had to exist on node-4: `/data/snapfix/criu-plugins`
+(empty is fine with the stock plugin dir) and `/data/snapfix/cuda-compat`
+(copied from node-3, 470 MB, same 580.105.08 driver). The model itself was
+already in node-4's HF hub; only the `swap/gemma4-31b-fp8/gemma-a` symlink had
+to be created. The local runtime image
+`localhost/snapfix/dynamo-vllm-placeholder:v1.6.0-cu130` existed only on node-3,
+so it was saved (9.7 GB), served over the internal network, and loaded into
+node-4's containerd (1m20s).
+
+The snapshot was the TP8 one captured on node-3 (`snapfix-agg-tp8-v1`); the
+restore DGD moved only the worker to node-4 (`snapfix-agg-crossnode-v1.yaml`)
+with node-4's GPU UUIDs, leaving the frontend on node-3.
+
+| Phase | Result |
+|---|---|
+| Restore on node-4 | 1m9.7s total: CRIU 60.08s, CUDA 7.56s |
+| Registration | ~0.2s after "External restore completed" |
+| Frontend on node-3 | healthy, 3 endpoints, transport `10.0.11.2:37783` |
+| TTFT after restore, 6,360-char prompt | 314 / 120 / 124 / 119 / 134 ms, median 124 |
+| Node-4 cards | 8 compute processes, 16,834 MiB each |
+| Node-3 cards after the move | 4 MiB each, 0 compute processes |
+
+The restore landed on node-4 (`tm-ucc-hpfsset5-0001`, `10.0.11.2`), not node-3.
+This is a cross-node and cross-architecture restore: captured on B300, restored
+on the L20D node, same 580.105.08 driver. TTFT is unchanged within noise versus
+the same-node TP8 run (124 ms vs 126 ms median).

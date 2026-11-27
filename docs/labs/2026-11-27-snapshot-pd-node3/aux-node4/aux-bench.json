@@ -1,0 +1,113 @@
+{
+  "apiVersion": "v1",
+  "kind": "List",
+  "items": [
+    {
+      "apiVersion": "apps/v1",
+      "kind": "Deployment",
+      "metadata": {
+        "annotations": {},
+        "name": "bench",
+        "namespace": "aux-bench"
+      },
+      "spec": {
+        "progressDeadlineSeconds": 600,
+        "replicas": 4,
+        "revisionHistoryLimit": 10,
+        "selector": {
+          "matchLabels": {
+            "app": "bench"
+          }
+        },
+        "strategy": {
+          "rollingUpdate": {
+            "maxSurge": "25%",
+            "maxUnavailable": "25%"
+          },
+          "type": "RollingUpdate"
+        },
+        "template": {
+          "metadata": {
+            "annotations": {
+              "kubectl.kubernetes.io/restartedAt": "2026-11-26T09:59:08+08:00"
+            },
+            "labels": {
+              "app": "bench"
+            }
+          },
+          "spec": {
+            "containers": [
+              {
+                "command": [
+                  "sleep",
+                  "infinity"
+                ],
+                "image": "localhost/scicom/vllm-openai:0.31.0-flashinfer-0.7.3-cu130",
+                "imagePullPolicy": "IfNotPresent",
+                "name": "bench",
+                "resources": {
+                  "limits": {
+                    "cpu": "4",
+                    "memory": "8Gi"
+                  },
+                  "requests": {
+                    "cpu": "4",
+                    "memory": "8Gi"
+                  }
+                },
+                "terminationMessagePath": "/dev/termination-log",
+                "terminationMessagePolicy": "File",
+                "volumeMounts": [
+                  {
+                    "mountPath": "/bench",
+                    "name": "script"
+                  }
+                ]
+              }
+            ],
+            "dnsPolicy": "ClusterFirst",
+            "nodeSelector": {
+              "kubernetes.io/hostname": "tm-ucc-hpfsset5-0001"
+            },
+            "restartPolicy": "Always",
+            "schedulerName": "default-scheduler",
+            "securityContext": {},
+            "terminationGracePeriodSeconds": 30,
+            "volumes": [
+              {
+                "configMap": {
+                  "defaultMode": 420,
+                  "name": "bench-script"
+                },
+                "name": "script"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "apiVersion": "v1",
+      "data": {
+        "bench_aux.py": "\"\"\"Closed-loop load generator for the B300 aux services.\n\nOne process per shard; total concurrency = level. Each thread keeps one HTTP\nconnection and loops request -> response until the window ends. Warm-up requests\nfinish before the measured window starts, so no warm-up latency leaks into it.\n\nReports req/s, p50/p95/p99, error rate and RTF (processing time / audio time,\nso < 1 is faster than real time), plus the raw latencies for exact merging.\n\nUsage:\n  python bench_aux.py --svc stt --level 200 --duration 60 --warmup 10 --shard 0 --shards 4\n\"\"\"\nimport argparse\nimport io\nimport json\nimport math\nimport os\nimport random\nimport threading\nimport time\nimport wave\n\nimport requests\n\nHOSTS = {\n    \"emb\": (\"qwen3-embedding-8b.embed-rerank.svc.cluster.local\", 8000, \"/v1/embeddings\"),\n    \"rr\": (\"jina-reranker-v35.embed-rerank.svc.cluster.local\", 8000, \"/v1/rerank\"),\n    \"tts\": (\"tts-vllm.speech.svc.cluster.local\", 8000, \"/v1/completions\"),\n    \"ttsapi\": (\"tts-api.speech.svc.cluster.local\", 8000, \"/v1/audio/speech\"),\n    \"stt\": (\"stt-vllm.speech.svc.cluster.local\", 8000, \"/v1/audio/transcriptions\"),\n    \"sttapi\": (\"stt-api.speech.svc.cluster.local\", 8000, \"/audio/transcriptions\"),\n}\n\nEMB_TEXT = (\"Saya ingin bertanya mengenai bil bulan ini. Bil menunjukkan jumlah yang lebih tinggi \"\n            \"daripada bulan sebelumnya, dan saya tidak pasti apakah ini kerana penggunaan data yang \"\n            \"berlebihan atau kerana caj tambahan. Boleh anda terangkan pecahan caj tersebut?\") * 3\nRR_QUERY = \"How do I restore my Unifi service after a late payment?\"\nRR_DOCS = [\n    \"Restoration is available once the outstanding balance is settled in full. A payment made today is reflected within one hour.\",\n    \"If the account is barred for non-payment, the service resumes automatically after the payment posts to the billing system.\",\n    \"A partial payment leaves the account barred until the remaining balance is cleared or a payment arrangement is approved.\",\n    \"Customers on autopay should check that the card on file has not expired; a failed charge bars the line after seven days.\",\n    \"A reconnection fee may apply when the line has been barred for more than thirty days; the fee is shown before payment.\",\n    \"To check the balance, open the Unifi app, select Billing, and read the outstanding amount on the account summary.\",\n    \"A payment arrangement splits the outstanding balance across three months and keeps the service active while it is honoured.\",\n    \"If the service is still barred six hours after payment, contact Care Crew with the payment reference for a manual restore.\",\n]\nTTS_TEXTS = [\n    \"Baik, saya sudah semak akaun tuan. Bil bulan ini berjumlah dua ratus tiga puluh lima ringgit dan tujuh puluh sen. Ia merangkumi caj bulanan dan penggunaan data tambahan sebanyak dua puluh ringgit. Adakah tuan ingin membuat pembayaran sekarang?\",\n    \"Terima kasih kerana menghubungi Unifi. Saya dapati talian tuan mengalami gangguan sejak pagi tadi. Pasukan teknikal sedang memeriksa kawasan tersebut dan anggaran pemulihan adalah dalam masa empat jam. Saya akan maklumkan kepada tuan jika ada perkembangan.\",\n    \"Untuk memulihkan perkhidmatan, tuan perlu menjelaskan baki tertunggak terlebih dahulu. Selepas pembayaran diterima, talian akan diaktifkan semula dalam masa satu jam. Sila pastikan nombor akaun disebut dengan betul semasa pembayaran dibuat.\",\n    \"Saya boleh membantu tuan menukar pelan kepada pakej yang lebih sesuai. Pakej baharu akan berkuat kuasa pada hari pertama bulan hadapan, dan tiada caj penalti dikenakan untuk pertukaran ini. Adakah tuan ingin saya teruskan?\",\n]\n\n\ndef make_wav(seconds: float) -> bytes:\n    n = int(16000 * seconds)\n    buf = io.BytesIO()\n    with wave.open(buf, \"wb\") as w:\n        w.setnchannels(1)\n        w.setsampwidth(2)\n        w.setframerate(16000)\n        w.writeframes(os.urandom(2 * n))\n    return buf.getvalue()\n\n\ndef payload(svc: str, i: int):\n    if svc == \"emb\":\n        return {\"json\": {\"model\": \"Qwen/Qwen3-Embedding-8B\", \"input\": EMB_TEXT}}\n    if svc == \"rr\":\n        return {\"json\": {\"model\": \"jina-reranker-v3.5\", \"query\": RR_QUERY, \"documents\": RR_DOCS}}\n    if svc == \"tts\":\n        text = TTS_TEXTS[i % len(TTS_TEXTS)]\n        prompt = f\"<|im_start|>user\\n{text}<|im_end|>\\n<|im_start|>assistant\\n\"\n        return {\"json\": {\"model\": \"TTS-model\", \"prompt\": prompt, \"max_tokens\": 512,\n                         \"temperature\": 0.0}}\n    if svc == \"ttsapi\":\n        return {\"json\": {\"model\": \"TTS-model\", \"voice\": \"haiqal\",\n                         \"input\": TTS_TEXTS[i % len(TTS_TEXTS)], \"response_format\": \"wav\"}}\n    if svc == \"stt\":\n        dur = math.exp(random.uniform(math.log(1.0), math.log(10.0)))\n        wav = make_wav(dur)\n        return {\"files\": {\"file\": (\"a.wav\", wav, \"audio/wav\")},\n                \"data\": {\"model\": \"scicom-ai-enterprise/whisper-large-v3-turbo-2025-09-09\"},\n                \"_audio_s\": dur}\n    if svc == \"sttapi\":\n        dur = math.exp(random.uniform(math.log(1.0), math.log(10.0)))\n        wav = make_wav(dur)\n        return {\"files\": {\"file\": (\"a.wav\", wav, \"audio/wav\")}, \"data\": {\"language\": \"en\"},\n                \"_audio_s\": dur}\n    raise SystemExit(\"unknown svc \" + svc)\n\n\ndef wav_seconds(body: bytes) -> float:\n    \"\"\"Duration from the RIFF chunks, tolerating a streaming 0xFFFFFFFF data size.\"\"\"\n    if len(body) < 44 or body[:4] != b\"RIFF\":\n        return len(body) / 2.0 / 24000.0\n    i, rate, ch, bits, data_off, data_len = 12, 24000, 1, 16, None, None\n    while i + 8 <= len(body):\n        cid, sz = body[i:i + 4], int.from_bytes(body[i + 4:i + 8], \"little\")\n        if cid == b\"fmt \":\n            ch = int.from_bytes(body[i + 10:i + 12], \"little\")\n            rate = int.from_bytes(body[i + 12:i + 16], \"little\")\n            bits = int.from_bytes(body[i + 22:i + 24], \"little\")\n        elif cid == b\"data\":\n            data_off, data_len = i + 8, sz\n            break\n        i += 8 + sz + (sz & 1)\n    if data_off is None:\n        return len(body) / 2.0 / 24000.0\n    n = len(body) - data_off if data_len in (0, 0xFFFFFFFF) else min(data_len, len(body) - data_off)\n    return n / float(rate * ch * max(1, bits // 8))\n\n\ndef main():\n    ap = argparse.ArgumentParser()\n    ap.add_argument(\"--svc\", required=True, choices=list(HOSTS))\n    ap.add_argument(\"--level\", type=int, required=True)\n    ap.add_argument(\"--duration\", type=int, default=60)\n    ap.add_argument(\"--warmup\", type=int, default=10)\n    ap.add_argument(\"--shard\", type=int, default=0)\n    ap.add_argument(\"--shards\", type=int, default=1)\n    args = ap.parse_args()\n\n    host, port, path = HOSTS[args.svc]\n    conc = max(1, math.ceil(args.level / args.shards))\n    base = f\"http://{host}:{port}\"\n    stop = threading.Event()\n    warm_done = threading.Event()\n    barrier_start = threading.Barrier(conc + 1)\n    barrier_window = threading.Barrier(conc + 1)\n    lock = threading.Lock()\n    stats = {\"lat\": [], \"err\": 0, \"n\": 0, \"audio\": 0.0, \"errs\": []}\n\n    def one(s, i, record):\n        p = payload(args.svc, i)\n        audio_s = p.pop(\"_audio_s\", 0.0)\n        t0 = time.perf_counter()\n        body = b\"\"\n        try:\n            r = s.post(base + path, timeout=120, **p)\n            body = r.content\n            ok = 200 <= r.status_code < 300\n        except Exception as e:\n            ok = False\n            with lock:\n                if len(stats[\"errs\"]) < 3:\n                    stats[\"errs\"].append(type(e).__name__ + \": \" + str(e)[:120])\n        dt = (time.perf_counter() - t0) * 1000.0\n        if record:\n            with lock:\n                stats[\"n\"] += 1\n                stats[\"lat\"].append(dt)\n                if ok:\n                    if args.svc == \"ttsapi\":\n                        stats[\"audio\"] += wav_seconds(body)\n                    elif args.svc == \"tts\":\n                        try:\n                            txt = r.json()[\"choices\"][0][\"text\"]\n                            stats[\"audio\"] += txt.count(\"<|s_\") / 50.0\n                        except Exception:\n                            pass\n                    elif args.svc in (\"stt\", \"sttapi\"):\n                        stats[\"audio\"] += audio_s\n                else:\n                    stats[\"err\"] += 1\n        return i + 1\n\n    def worker(tid: int):\n        s = requests.Session()\n        s.mount(\"http://\", requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=4))\n        i = tid\n        barrier_start.wait()\n        while not warm_done.is_set():\n            i = one(s, i, False)\n        barrier_window.wait()\n        while not stop.is_set():\n            i = one(s, i, True)\n\n    threads = [threading.Thread(target=worker, args=(t,), daemon=True) for t in range(conc)]\n    for t in threads:\n        t.start()\n    barrier_start.wait()\n    time.sleep(args.warmup)\n    warm_done.set()\n    barrier_window.wait()\n    with lock:\n        stats[\"lat\"].clear(); stats[\"n\"] = 0; stats[\"err\"] = 0; stats[\"audio\"] = 0.0\n    t_start = time.perf_counter()\n    time.sleep(args.duration)\n    stop.set()\n    for t in threads:\n        t.join(timeout=30)\n    elapsed = time.perf_counter() - t_start\n\n    lat = sorted(stats[\"lat\"])\n    def pct(p):\n        return lat[min(len(lat) - 1, int(len(lat) * p))] if lat else None\n    wall = sum(x / 1000.0 for x in lat)\n    out = {\n        \"svc\": args.svc, \"level\": args.level, \"shard\": args.shard, \"shards\": args.shards,\n        \"conc\": conc, \"elapsed_s\": round(elapsed, 1), \"n\": stats[\"n\"],\n        \"rps\": round(stats[\"n\"] / elapsed, 2),\n        \"err\": stats[\"err\"], \"err_pct\": round(100.0 * stats[\"err\"] / max(1, stats[\"n\"]), 2),\n        \"p50_ms\": round(pct(0.50), 1) if lat else None,\n        \"p95_ms\": round(pct(0.95), 1) if lat else None,\n        \"p99_ms\": round(pct(0.99), 1) if lat else None,\n        \"max_ms\": round(lat[-1], 1) if lat else None,\n        \"rtf\": round(wall / stats[\"audio\"], 4) if stats[\"audio\"] else None,\n        \"x_realtime\": round(stats[\"audio\"] / max(1e-9, wall), 1) if stats[\"audio\"] else None,\n        \"audio_s\": round(stats[\"audio\"], 1),\n        \"audio_per_req_s\": round(stats[\"audio\"] / max(1, stats[\"n\"]), 2) if stats[\"audio\"] else None,\n        \"errors\": stats[\"errs\"],\n        \"lat\": [round(x, 1) for x in lat],\n    }\n    print(json.dumps(out))\n\n\nif __name__ == \"__main__\":\n    main()\n",
+        "bench_enh.py": "\"\"\"Enhancer WebSocket load generator: one socket per call, 50 ms chunks at 20/s.\"\"\"\nimport argparse, asyncio, json, math, os, time\nimport aiohttp\n\ndef main():\n    ap = argparse.ArgumentParser()\n    ap.add_argument(\"--url\", default=\"ws://enhancer.speech.svc.cluster.local:8765\")\n    ap.add_argument(\"--streams\", type=int, required=True)\n    ap.add_argument(\"--duration\", type=int, default=60)\n    ap.add_argument(\"--warmup\", type=int, default=20)\n    ap.add_argument(\"--shard\", type=int, default=0)\n    ap.add_argument(\"--shards\", type=int, default=1)\n    ap.add_argument(\"--chunk-ms\", type=int, default=40)\n    a = ap.parse_args()\n    conc = max(1, math.ceil(a.streams / a.shards))\n    chunk = os.urandom(2 * 16 * a.chunk_ms)  # 16 kHz int16\n    stop = asyncio.Event(); warm = asyncio.Event()\n    lat = []; errs = []; audio = 0.0; sent = 0; err = 0\n    lock = asyncio.Lock()\n\n    async def stream(idx):\n        nonlocal audio, sent, err\n        try:\n            async with aiohttp.ClientSession() as s:\n                async with s.ws_connect(a.url, max_msg_size=0, timeout=aiohttp.ClientWSTimeout(ws_close=5)) as ws:\n                    while not stop.is_set():\n                        t0 = time.perf_counter()\n                        await ws.send_bytes(chunk)\n                        msg = await asyncio.wait_for(ws.receive(), timeout=10)\n                        dt = (time.perf_counter() - t0) * 1000.0\n                        if msg.type == aiohttp.WSMsgType.BINARY:\n                            if warm.is_set():\n                                n = len(msg.data) if msg.data else 0\n                                async with lock:\n                                    lat.append(dt); audio += (n / 2.0) / 16000.0; sent += 1\n                        elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):\n                            raise RuntimeError(\"closed\")\n                        await asyncio.sleep(max(0.0, a.chunk_ms / 1000.0 - (time.perf_counter() - t0)))\n        except Exception as e:\n            async with lock:\n                err += 1\n                if len(errs) < 3: errs.append(type(e).__name__ + \": \" + str(e)[:120])\n\n    async def run():\n        nonlocal err, audio, sent\n        tasks = [asyncio.create_task(stream(i)) for i in range(conc)]\n        await asyncio.sleep(a.warmup); warm.set()\n        async with lock: lat.clear(); audio = 0.0; sent = 0\n        t0 = time.perf_counter(); await asyncio.sleep(a.duration); stop.set()\n        await asyncio.gather(*tasks, return_exceptions=True)\n        el = time.perf_counter() - t0\n        lat.sort()\n        def pct(p): return lat[min(len(lat)-1, int(len(lat)*p))] if lat else None\n        wall = sum(lat) / 1000.0\n        print(json.dumps({\"svc\":\"enh\",\"streams\":a.streams,\"shard\":a.shard,\"conc\":conc,\"elapsed_s\":round(el,1),\n            \"chunks\":sent,\"chunks_s\":round(sent/el,1),\"err\":err,\"err_pct\":round(100*err/max(1,conc),2),\n            \"p50_ms\":round(pct(0.5),1) if lat else None,\"p95_ms\":round(pct(0.95),1) if lat else None,\n            \"p99_ms\":round(pct(0.99),1) if lat else None,\n            \"over_30_pct\":round(100*sum(1 for x in lat if x>30)/max(1,len(lat)),2),\n            \"over_200_pct\":round(100*sum(1 for x in lat if x>200)/max(1,len(lat)),2),\n            \"rtf\":round(wall/audio,4) if audio else None,\"audio_s\":round(audio,1),\"errors\":errs,\n            \"lat\":[round(x,1) for x in lat]}))\n    asyncio.run(run())\n\nif __name__ == \"__main__\":\n    main()\n",
+        "bench_eot.py": "\"\"\"EOT /predict load generator: base64 s16le 16 kHz PCM, closed-loop.\"\"\"\nimport argparse, base64, io, json, math, os, random, threading, time, wave\nimport requests\n\ndef wav(seconds):\n    n = int(16000 * seconds)\n    return os.urandom(2 * n)\n\ndef main():\n    ap = argparse.ArgumentParser()\n    ap.add_argument(\"--url\", default=\"http://eot.speech.svc.cluster.local:9097/predict\")\n    ap.add_argument(\"--level\", type=int, required=True)\n    ap.add_argument(\"--duration\", type=int, default=60)\n    ap.add_argument(\"--warmup\", type=int, default=10)\n    ap.add_argument(\"--shard\", type=int, default=0)\n    ap.add_argument(\"--shards\", type=int, default=1)\n    ap.add_argument(\"--min-s\", type=float, default=1.0)\n    ap.add_argument(\"--max-s\", type=float, default=3.0)\n    a = ap.parse_args()\n    conc = max(1, math.ceil(a.level / a.shards))\n    stop = threading.Event(); warm = threading.Event()\n    b0 = threading.Barrier(conc + 1); b1 = threading.Barrier(conc + 1)\n    lock = threading.Lock(); st = {\"lat\": [], \"n\": 0, \"err\": 0, \"audio\": 0.0, \"errs\": []}\n\n    def one(s, record):\n        dur = math.exp(random.uniform(math.log(a.min_s), math.log(a.max_s)))\n        pcm = wav(dur)\n        t0 = time.perf_counter()\n        try:\n            r = s.post(a.url, json={\"audio\": base64.b64encode(pcm).decode(), \"sample_rate\": 16000}, timeout=120)\n            ok = 200 <= r.status_code < 300\n        except Exception as e:\n            ok = False\n            with lock:\n                if len(st[\"errs\"]) < 3: st[\"errs\"].append(type(e).__name__ + \": \" + str(e)[:120])\n        dt = (time.perf_counter() - t0) * 1000.0\n        if record:\n            with lock:\n                st[\"n\"] += 1; st[\"lat\"].append(dt)\n                if ok: st[\"audio\"] += dur\n                else: st[\"err\"] += 1\n\n    def worker(tid):\n        s = requests.Session(); s.mount(\"http://\", requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=4))\n        b0.wait()\n        while not warm.is_set(): one(s, False)\n        b1.wait()\n        while not stop.is_set(): one(s, True)\n\n    ts = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(conc)]\n    for t in ts: t.start()\n    b0.wait(); time.sleep(a.warmup); warm.set(); b1.wait()\n    with lock: st[\"lat\"].clear(); st[\"n\"] = 0; st[\"err\"] = 0; st[\"audio\"] = 0.0\n    t0 = time.perf_counter(); time.sleep(a.duration); stop.set()\n    for t in ts: t.join(timeout=30)\n    el = time.perf_counter() - t0\n    lat = sorted(st[\"lat\"])\n    def pct(p): return lat[min(len(lat)-1, int(len(lat)*p))] if lat else None\n    wall = sum(lat) / 1000.0\n    print(json.dumps({\"svc\":\"eot\",\"level\":a.level,\"shard\":a.shard,\"conc\":conc,\"elapsed_s\":round(el,1),\n        \"n\":st[\"n\"],\"rps\":round(st[\"n\"]/el,2),\"err\":st[\"err\"],\"err_pct\":round(100*st[\"err\"]/max(1,st[\"n\"]),2),\n        \"p50_ms\":round(pct(0.5),1) if lat else None,\"p95_ms\":round(pct(0.95),1) if lat else None,\n        \"p99_ms\":round(pct(0.99),1) if lat else None,\"max_ms\":round(lat[-1],1) if lat else None,\n        \"rtf\":round(wall/st[\"audio\"],4) if st[\"audio\"] else None,\"audio_s\":round(st[\"audio\"],1),\n        \"errors\":st[\"errs\"],\"lat\":[round(x,1) for x in lat]}))\n\nif __name__ == \"__main__\":\n    main()\n"
+      },
+      "kind": "ConfigMap",
+      "metadata": {
+        "annotations": {},
+        "name": "bench-script",
+        "namespace": "aux-bench"
+      }
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "ServiceAccount",
+      "metadata": {
+        "name": "default",
+        "namespace": "aux-bench",
+        "annotations": null
+      }
+    }
+  ]
+}
