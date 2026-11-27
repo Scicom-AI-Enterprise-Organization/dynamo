@@ -97,7 +97,15 @@ func ExecuteRestore(
 
 // BuildRestoreOpts assembles CriuOpts for a CRIU restore from the checkpoint manifest.
 // ImagesDirFd and WorkDirFd are left unset — ExecuteRestore opens them at restore time.
-func BuildRestoreOpts(m *types.CheckpointManifest, checkpointPath string, cgroupRoot string, log logr.Logger) (*criurpc.CriuOpts, error) {
+//
+// mntnsCompatMode, when non-nil, overrides the value recorded in the checkpoint.
+// It is a restore-only CRIU option (the old mount engine), so the agent's live
+// configuration can safely win over the dump-time manifest. This matters for
+// NVIDIA-runtime bind mounts: CRIU's mount-v2 engine fails to copy the slave
+// sharing group of /dev/nvidia* ("Failed to copy sharing ... Invalid argument"),
+// and a checkpoint captured before the option was enabled would otherwise be
+// unrestorable without a re-capture.
+func BuildRestoreOpts(m *types.CheckpointManifest, checkpointPath string, cgroupRoot string, mntnsCompatMode *bool, log logr.Logger) (*criurpc.CriuOpts, error) {
 	extMounts, err := buildRestoreExtMounts(m)
 	if err != nil {
 		return nil, err
@@ -116,7 +124,11 @@ func BuildRestoreOpts(m *types.CheckpointManifest, checkpointPath string, cgroup
 
 	// Restore-only options
 	criuOpts.RstSibling = proto.Bool(settings.RstSibling)
-	criuOpts.MntnsCompatMode = proto.Bool(settings.MntnsCompatMode)
+	if mntnsCompatMode != nil {
+		criuOpts.MntnsCompatMode = proto.Bool(*mntnsCompatMode)
+	} else {
+		criuOpts.MntnsCompatMode = proto.Bool(settings.MntnsCompatMode)
+	}
 	criuOpts.EvasiveDevices = proto.Bool(settings.EvasiveDevices)
 	criuOpts.ForceIrmap = proto.Bool(settings.ForceIrmap)
 

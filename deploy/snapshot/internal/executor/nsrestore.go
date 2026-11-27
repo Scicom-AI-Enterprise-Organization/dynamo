@@ -21,6 +21,10 @@ type RestoreOptions struct {
 	CUDADeviceMap  string
 	CgroupRoot     string
 	TargetPodIP    string
+	// MntnsCompatMode, when non-nil, overrides the checkpoint's recorded CRIU
+	// mount-namespace mode. The agent passes its live configuration here so a
+	// restore-only option does not depend on when the checkpoint was captured.
+	MntnsCompatMode *bool
 }
 
 type RestoreInNamespaceResult struct {
@@ -58,7 +62,7 @@ func RestoreInNamespace(ctx context.Context, opts RestoreOptions, log logr.Logge
 	if err := criu.ConfigureInetRemap(m, opts.TargetPodIP, log); err != nil {
 		return nil, err
 	}
-	criuOpts, err := criu.BuildRestoreOpts(m, opts.CheckpointPath, opts.CgroupRoot, log)
+	criuOpts, err := criu.BuildRestoreOpts(m, opts.CheckpointPath, opts.CgroupRoot, opts.MntnsCompatMode, log)
 	if err != nil {
 		return nil, err
 	}

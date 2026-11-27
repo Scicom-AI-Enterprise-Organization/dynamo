@@ -203,7 +203,14 @@ config:
 
     # Restore-specific options (only apply during CRIU restore, not dump)
     rstSibling: true         # Restore as sibling process (required for go-criu swrk mode)
-    mntnsCompatMode: false   # Mount namespace compatibility mode
+    # Use CRIU's legacy mount engine instead of mount-v2. Required on nodes
+    # whose NVIDIA runtime bind-mounts the device nodes: mount-v2 cannot copy
+    # the slave sharing group of /dev/nvidia* and restore fails with
+    # "mnt-v2: Failed to copy sharing from source /dev/nvidia0 ... Invalid
+    # argument" (CRIU issue #2601, ai-dynamo/snapshot#144). The agent applies
+    # its live value at restore, so this also covers checkpoints captured
+    # before the option was enabled.
+    mntnsCompatMode: true
     evasiveDevices: true     # Use any device path if original is inaccessible
     forceIrmap: true         # Force resolving inotify/fsnotify watch names
 

@@ -112,6 +112,7 @@ kubectl get pods -n ${NAMESPACE} -l app.kubernetes.io/name=snapshot -o wide
 | `daemonset.imagePullSecrets` | Image pull secrets for the agent | `[{name: ngc-secret}]` |
 | `runtime.type` | CRI backend: `containerd` or `crio` | `containerd` |
 | `runtime.socketPath` | CRI socket (empty = default for `runtime.type`) | `""` |
+| `config.criu.mntnsCompatMode` | Restore with CRIU's legacy mount engine instead of mount-v2. Required when the NVIDIA runtime bind-mounts the device nodes; mount-v2 fails on their slave sharing group. The agent applies its live value at restore | `true` |
 | `openshift.enabled` | OpenShift RBAC / SCC-related chart pieces | `false` |
 
 Reserved `s3` and `oci` values remain chart-owned placeholders for future

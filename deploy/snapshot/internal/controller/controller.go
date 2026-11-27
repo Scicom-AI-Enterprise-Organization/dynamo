@@ -570,7 +570,10 @@ func (w *NodeController) runRestore(ctx context.Context, pod *corev1.Pod, contai
 		return fmt.Errorf("failed to annotate pod with restore in_progress: %w", err)
 	}
 
-	// Run the restore orchestrator (inspect + nsrestore).
+	// Run the restore orchestrator (inspect + nsrestore). mntnsCompatMode is a
+	// restore-only CRIU option, so the agent's live setting wins over whatever
+	// the checkpoint recorded at capture time.
+	mntnsCompatMode := w.config.CRIU.MntnsCompatMode
 	req := executor.RestoreRequest{
 		CheckpointID:                checkpointID,
 		CheckpointLocation:          checkpointLocation.HostPath,
@@ -583,6 +586,7 @@ func (w *NodeController) runRestore(ctx context.Context, pod *corev1.Pod, contai
 		TargetPodIP:                 pod.Status.PodIP,
 		ContainerName:               containerName,
 		Clientset:                   w.clientset,
+		MntnsCompatMode:             &mntnsCompatMode,
 	}
 	placeholderHostPID, err := executor.Restore(restoreCtx, w.runtime, log, req)
 	if err != nil {

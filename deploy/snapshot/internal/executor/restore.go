@@ -35,6 +35,10 @@ type RestoreRequest struct {
 	TargetPodIP                 string
 	ContainerName               string
 	Clientset                   kubernetes.Interface
+	// MntnsCompatMode is the agent's live CRIU mount-namespace setting. When
+	// non-nil it overrides the value recorded in the checkpoint, so a
+	// restore-only option does not depend on when the checkpoint was captured.
+	MntnsCompatMode *bool
 }
 
 // Restore performs external restore for the given request.
@@ -216,6 +220,9 @@ func execNSRestore(ctx context.Context, log logr.Logger, req RestoreRequest, sna
 	}
 	if req.TargetPodIP != "" {
 		args = append(args, "--target-pod-ip", req.TargetPodIP)
+	}
+	if req.MntnsCompatMode != nil {
+		args = append(args, "--mntns-compat-mode", strconv.FormatBool(*req.MntnsCompatMode))
 	}
 
 	cmd := exec.CommandContext(ctx, "nsenter", args...)
