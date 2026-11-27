@@ -1,0 +1,15 @@
+apiVersion: nvidia.com/v1alpha1
+kind: PodSnapshot
+metadata:
+  name: snapfix-agg-tp8-v1
+  namespace: snapfix-lab
+spec:
+  source:
+    podRef:
+      name: snapfix-agg-vllmworker-cbbbf592-549888cc6b-bnlvq
+      containers: ["main"]
+  containers:
+  - name: main
+    checkpointReadinessProbe:
+      file:
+        path: /snapshot-control/ready-for-snapshot

@@ -451,3 +451,40 @@ restore (42.6s), and the restored engine serves at the numbers above.
 7. The abandoned `snapfix-pd` DGD was still reconciling and spawning pods,
    competing for node-3 GPUs and the declared host port. Deleting that DGD and
    its pods was required before the aggregated restore could schedule.
+
+## Aggregated TP8, all eight cards (2026-11-27, later still)
+
+Same aggregated shape as the TP4 run, with `--tensor-parallel-size 8` over all
+eight node-3 GPUs, one container, no NIXL. Every contract fix from the TP4 run
+was carried over (read-only `/tmp/snapshot-cuda`, `subPath: main` on
+`/snapshot-control`, `SNAPSHOT_CONTROL_DIR`, the `restore-context` init
+container, frontend pointed at the worker's full namespace).
+
+| Phase | TP8 | TP4 for comparison |
+|---|---|---|
+| Cold start to `ready-for-snapshot` | 7m03s from container start (7m44s from pod creation) | 2m40s |
+| Capture total | 4m24.0s | 1m55.0s |
+| CRIU dump | 1m59.4s | 45.0s |
+| CUDA checkpoint | 24.6s | 17.3s |
+| Publish/switch | 1m58.6s | 51.7s |
+| Restore total | 1m21.5s | 42.6s |
+| CRIU restore | 71.98s | 34.2s |
+| CUDA restore | 7.36s | 7.37s |
+| Registration after restore | ~0.5s | ~0.3s |
+| TTFT after restore, 6,360-char prompt | 259 / 119 / 126 / 126 / 116 ms (median 126) | median 120 ms |
+
+The restored engine really is TP8: eight compute processes, 16.8 GiB on each of
+the eight cards, three endpoints registered under
+`snapfix-lab-snapfix-agg-bd5f4440`, frontend healthy with three instances.
+
+Capture and restore scale roughly with rank count (CRIU dump 2.65x, CRIU
+restore 2.1x, publish 2.3x), and serving latency is unchanged within noise
+(126 ms vs 120 ms median). The earlier 8-GPU result was a synthetic process;
+this is the first real engine across all eight cards.
+
+Two operational notes from this run: the wall-live loopback rules returned
+(186 per chain this time) and took node-3 NotReady mid-rollout, so they must be
+checked immediately before capture and again before the restore rollout. The
+captured source container restarts once after the checkpoint (the agent resumes
+it), so the DGD rollout left it stuck Terminating with two restarts; force
+deleting that pod freed the cards and the restore proceeded.
