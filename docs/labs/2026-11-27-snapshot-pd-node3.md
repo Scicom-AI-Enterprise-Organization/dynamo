@@ -353,10 +353,39 @@ the prefill/decode connections. That is a vLLM/NIXL lifecycle change of the
 same class as the compiled-kernel rebuild; the current branch does not have
 it. The TCP fallback is the only working path and costs ~10x TTFT.
 
-## `a94bd0a` hook status
+## `a94bd0a` hook: correctness, not speed
 
-The lab placeholder image does not contain `_rebuild_compiled_kernel_state`
-(`grep` count 0). The restored process recompiled a Triton kernel on demand
-(`_gumbel_sample_kernel` JIT), so the restore worked, but the hook itself is
-not proven in the image. The image needs rebuilding with the branch's
-`snapshot.py` before the hook can be exercised.
+`a94bd0a` prevents the v1 `Placeholder.DESCRIPTIVE_NAME` restore failure by
+clearing `torch._dynamo`/Inductor's in-process caches after restore, so the
+restored process recompiles the kernels instead of reusing captured
+descriptors. It is a correctness fix, not a speedup: the recompile still costs
+latency, and the 1,402-1,473 ms is the TCP fallback plus that recompilation.
+
+The image rebuild was blocked: node3 has `nerdctl` but no `buildkit`. The
+branch's `snapshot.py` was mounted at the exact image path in the v7 source and
+restore workers (`grep -c _rebuild_compiled_kernel_state` = 2), so the v7
+capture/restore exercises the hook in-process. The v7 capture was started; if
+the restore does not finish, it is outstanding, not a negative result.
+
+## Final numbers
+
+| Case | Capture | Restore |
+|---|---|---|
+| Single GPU, Qwen3-Embedding-8B TP1 (`snap-embed4`) | 2m44.5s total: CUDA 36.2s, CRIU 26.1s, publish 101.8s | 1.33s total: CRIU 748ms |
+| Single-GPU tiny CUDA control (`snap-tiny`) | captured/verified; no phase breakdown | not measured |
+| 8 GPUs, one node (`snapfix-multi615`) | ~6s | 6.13s: CRIU 475ms, CUDA 4.79s |
+| TP4 prefill + TP4 decode, one node, TCP (v5) | CRIU 75.0s prefill / 73.8s decode; total ~3m | 1m25.8s prefill / 1m1.7s decode |
+| TP4+TP4, v6 with the hook file | CRIU 78.6s prefill / 75.5s decode | rejected: NRI not ready; snapshot consumed |
+| TP4+TP4, v7 with the hook file | CRIU 77.3s prefill / 75.4s decode; Ready=True | outstanding: pods pending on the HAMi lock |
+
+TTFT, v5 TCP, 6,360-char prompt, 8 max tokens: 1,402 / 1,444 / 1,473 / 1,454 /
+1,464 ms. The baseline is 141-168 ms. NIXL is the TCP fallback, not RoCE; the
+difference is transport plus recompilation.
+
+## Operational lesson
+
+Never restart `k3s-agent` between capture and restore. The NRI plugin does not
+re-register in time; the restore pod starts the app directly, the agent rejects
+it (`the container's PID 1 is ... not /snapshot-control/snapshot-restore-proxy`),
+the restore fails, and the one-shot snapshot is consumed. The v6 run hit
+exactly this; v7 was recaptured after the agent stabilized.

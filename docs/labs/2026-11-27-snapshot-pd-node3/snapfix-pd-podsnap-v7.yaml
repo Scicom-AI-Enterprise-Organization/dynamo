@@ -1,0 +1,31 @@
+apiVersion: nvidia.com/v1alpha1
+kind: PodSnapshot
+metadata:
+  name: snapfix-pd-prefill-v7
+  namespace: snapfix-lab
+spec:
+  source:
+    podRef:
+      name: snapfix-pd-vllmprefillworker-6a923fd6-6f65d4c678-ll52x
+      containers: ["main"]
+  containers:
+  - name: main
+    checkpointReadinessProbe:
+      file:
+        path: /snapshot-control/ready-for-snapshot
+---
+apiVersion: nvidia.com/v1alpha1
+kind: PodSnapshot
+metadata:
+  name: snapfix-pd-decode-v7
+  namespace: snapfix-lab
+spec:
+  source:
+    podRef:
+      name: snapfix-pd-vllmdecodeworker-6a923fd6-84dccdb57-vhgbk
+      containers: ["main"]
+  containers:
+  - name: main
+    checkpointReadinessProbe:
+      file:
+        path: /snapshot-control/ready-for-snapshot
