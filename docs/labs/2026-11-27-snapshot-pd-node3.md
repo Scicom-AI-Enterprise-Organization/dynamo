@@ -174,8 +174,9 @@ Repro fixed here: `criu/mount-v2.c:897: Failed to copy sharing from
 -1:/dev/nvidia0 to 101: Invalid argument`, then
 `cr-restore.c:2419: Restoring FAILED`.
 
-Capture uses the hook-only `snapshot_nvidia_vma` CRIU plugin (majors 195/499)
-plus inet-remap; the full CRIU CUDA plugin is disabled. The pair is pinned to
+Capture uses the hook-only `snapshot_nvidia_vma` CRIU plugin (majors
+195/499/231) plus inet-remap; the full CRIU CUDA plugin is disabled. The pair
+is pinned to
 loopback for same-node capture/restore: `VLLM_HOST_IP=127.0.0.1`,
 `VLLM_NIXL_SIDE_CHANNEL_HOST=127.0.0.1`, `GLOO_SOCKET_IFNAME=lo`,
 `TP_SOCKET_IFNAME=lo`, `NCCL_SOCKET_IFNAME=lo`,
@@ -198,3 +199,35 @@ failed with `Restore already used by an earlier container; restores are not
 repeatable` (06:41:45Z) and went into CrashLoopBackOff. The
 `snapfix-pd-prefill` PodSnapshot is consumed; a fresh capture under a new
 snapshot name is required before the serving/TTFT/NIXL proof can complete.
+
+## 2026-11-27 09:34Z: uverbs fds, and the TCP lab workaround
+
+The v2/v3 captures cleared the VMA hook but failed on CRIU's next step:
+
+```text
+Error (criu/files-ext.c:98): Can't dump file 242 of that type [20666] (chr 231:192)
+Error (criu/cr-dump.c:1550): Dump files (pid: 3160479) failed with -1
+Error (criu/cr-dump.c:2005): Dumping FAILED.
+```
+
+The workers had opened `/dev/infiniband/uverbs0..7` (major 231) because UCX
+was configured with `UCX_TLS=rc_x` and the mlx5 devices. The hook-only plugin
+now claims major 231, but CRIU has no checkpoint for the uverbs file
+descriptor or the RDMA QP/MR state behind it; `files-ext.c` needs a
+`DUMP_EXT_FILE` plugin, and a reopened uverbs fd would be a fresh, empty
+context. That is outside the GPU snapshot path.
+
+For the single-node GPU-restore proof the lab pair uses TCP/loopback UCX:
+
+```text
+UCX_TLS=tcp,cuda_copy,cuda_ipc
+UCX_NET_DEVICES=lo
+```
+
+so no uverbs fds are opened. This is a lab-only deviation; RoCE/NIXL over
+uverbs remains the open blocker for the cross-node test. The rest of the pair
+config (vLLM cache mount, `--kernel-config '{"enable_cutedsl_warmup": false}'`,
+loopback sockets) is unchanged.
+
+The `binfmt_misc` line at the top of CRIU's log is not fatal; it appears in
+every dump. The fatal line is the last `Error` before `Dumping FAILED`.

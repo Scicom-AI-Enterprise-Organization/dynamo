@@ -1,13 +1,15 @@
 # snapshot_nvidia_vma
 
-A hook-only CRIU plugin that claims NVIDIA character-device VMAs during dump.
+A hook-only CRIU plugin that claims NVIDIA and InfiniBand uverbs
+character-device VMAs during dump.
 
 ## Why
 
 CRIU refuses non-regular mappings unless a loaded plugin claims them through
 `HANDLE_DEVICE_VMA`. vLLM and NCCL keep small shared mappings of
-`/dev/nvidiaN`; the CRIU CUDA plugin does not register that hook, so a dump
-fails with:
+`/dev/nvidiaN`, and when NIXL uses RDMA, UCX maps
+`/dev/infiniband/uverbsN` for its doorbell pages; the CRIU CUDA plugin does
+not register that hook, so a dump fails with:
 
 ```text
 handle_device_vma plugin failed: No such file or directory
@@ -17,8 +19,8 @@ Can't handle non-regular mapping
 The agent already checkpoints CUDA state through `cuda-checkpoint-helper`.
 Loading the full CUDA plugin would run a second `PAUSE_DEVICES` /
 `CHECKPOINT_DEVICES` / `RESUME_DEVICES_LATE` against that same process. This
-plugin registers only `HANDLE_DEVICE_VMA`, returns 0 for the NVIDIA and UVM
-device majors, and lets the driver recreate the mapping at restore.
+plugin registers only `HANDLE_DEVICE_VMA`, returns 0 for the NVIDIA, UVM, and
+IB uverbs device majors, and lets the driver recreate the mapping at restore.
 
 ## Build
 

@@ -5,9 +5,10 @@
 #define SNAPSHOT_NVIDIA_VMA_MATCH_H
 
 /*
- * Returns 1 when dev_major is the major of an NVIDIA character device whose
- * mappings CRIU cannot dump as regular pages. A negative major means the
- * device node was not found and is ignored.
+ * Returns 1 when dev_major is the major of a device whose mappings CRIU
+ * cannot dump as regular pages: an NVIDIA character device, or the
+ * InfiniBand uverbs device that UCX/NIXL maps for its doorbell pages. A
+ * negative major means the device node was not found and is ignored.
  *
  * The agent owns CUDA state through cuda-checkpoint-helper; this plugin only
  * tells CRIU to keep the VMA metadata and leave the mapping to the driver's
@@ -16,10 +17,11 @@
  * process the agent already checkpointed.
  */
 static inline int
-snapshot_nvidia_vma_handles_major(int dev_major, int nvidia_major, int uvm_major)
+snapshot_nvidia_vma_handles_major(int dev_major, int nvidia_major, int uvm_major, int ib_uverbs_major)
 {
   return (nvidia_major >= 0 && dev_major == nvidia_major) ||
-         (uvm_major >= 0 && dev_major == uvm_major);
+         (uvm_major >= 0 && dev_major == uvm_major) ||
+         (ib_uverbs_major >= 0 && dev_major == ib_uverbs_major);
 }
 
 #endif
