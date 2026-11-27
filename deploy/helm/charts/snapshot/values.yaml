@@ -22,6 +22,11 @@
 runtime:
   type: containerd  # containerd | crio
   socketPath: ""
+  # Host per-container storage, mounted into the agent at the same absolute
+  # path. Empty uses the runtime's default: /var/lib/containerd (containerd)
+  # or /var/lib/containers (crio). k3s and RKE2 need
+  # /var/lib/rancher/k3s/agent/containerd (or the RKE2 equivalent).
+  storageDir: ""
 
 # Gates the OCP RBAC template and the DS required-scc annotation. Keep false
 # on vanilla Kubernetes (it references an OCP-only built-in SCC).
