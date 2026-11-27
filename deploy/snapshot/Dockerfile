@@ -182,6 +182,14 @@ RUN mkdir -p /criu-install/usr/local/lib/snapshot/criu-plugins \
       -o /criu-install/usr/local/lib/snapshot/criu-plugins/snapshot_inet_remap.so \
       /tmp/snapshot_inet_remap.c
 
+# Hook-only plugin: claims /dev/nvidia* VMAs without loading the full CUDA
+# plugin, whose pause/checkpoint/resume hooks would race cuda-checkpoint-helper.
+COPY plugins/nvidia-vma/snapshot_nvidia_vma.c plugins/nvidia-vma/nvidia_vma_match.h /tmp/
+RUN gcc -O2 -Wall -Wextra -fPIC -shared \
+      -idirafter /tmp/criu/criu/include \
+      -o /criu-install/usr/local/lib/snapshot/criu-plugins/snapshot_nvidia_vma.so \
+      /tmp/snapshot_nvidia_vma.c
+
 RUN git clone https://github.com/NVIDIA/cuda-checkpoint.git /tmp/cuda-checkpoint
 
 # =============================================================================

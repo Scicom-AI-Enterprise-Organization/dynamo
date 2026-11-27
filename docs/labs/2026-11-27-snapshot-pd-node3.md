@@ -100,3 +100,66 @@ Run the pair as two checkpoint jobs (SnapshotJob or DynamoCheckpoint) with the
 same pod template, ports, and model, so each engine is captured while paused at
 startup; then restore both into the pair's pods and repeat the TTFT and NIXL
 checks.
+
+## 2026-11-27 follow-up: NVIDIA VMA plugin, capture, and the wall-live
+
+The 0.3.0 cuinterpose path removes shared mappings but not the small shared
+mappings of `/dev/nvidiaN` that vLLM keeps. CRIU's `proc_parse.c` calls
+`run_plugins(HANDLE_DEVICE_VMA)` for those; neither the CUDA plugin nor the
+inet-remap plugin registers that hook, so the dump failed with
+`handle_device_vma plugin failed: No such file or directory`.
+
+The fix is a hook-only plugin, `deploy/snapshot/plugins/nvidia-vma`, installed
+as `/usr/local/lib/snapshot/criu-plugins/snapshot_nvidia_vma.so`. It claims the
+NVIDIA and UVM majors (195 and 499, resolved at init with those as fallback) and
+registers no pause/checkpoint/resume hooks, so it cannot race the agent's
+`cuda-checkpoint-helper`. The full CUDA plugin stays out of the chart's plugin
+directory.
+
+Configuration used for the successful captures (node-3 only):
+
+| Item | Value |
+|---|---|
+| Kernel driver | 580.105.08 (unchanged) |
+| CUDA user-mode | 615.71.10 via `/cuda-compat` (`LD_LIBRARY_PATH`) |
+| Snapshot agent | 0.3.0, `config.criu.libDir: /criu-plugins` |
+| Plugins | `snapshot_inet_remap.so` + `snapshot_nvidia_vma.so`; `cuda_plugin.so` disabled |
+| Worker launch | `cuinterpose-launch --library /tmp/snapshot-cuda/libcuinterpose.so -- python3 -m dynamo.vllm` |
+| Restore | `config.criu.mntnsCompatMode: true` |
+| Same-node sockets | `VLLM_HOST_IP=127.0.0.1`, `VLLM_NIXL_SIDE_CHANNEL_HOST=127.0.0.1`, `GLOO_SOCKET_IFNAME=lo`, `TP_SOCKET_IFNAME=lo`, `NCCL_SOCKET_IFNAME=lo` |
+| Engine timeout | `VLLM_ENGINE_ITERATION_TIMEOUT_S=600` |
+
+Capture results with the plugin (both `Ready=True`, "Checkpoint captured and
+verified"):
+
+| Worker | Total | CRIU dump | CUDA checkpoint |
+|---|---|---|---|
+| Prefill TP4 | 2m41s | 55.1s | 24.0s |
+| Decode TP4 | 2m8s | 50.0s | 17.2s |
+
+The restore also completed:
+
+| Worker | Total | CRIU restore | CUDA restore |
+|---|---|---|---|
+| Prefill TP4 | 1m21s | 70.7s | 6.3s |
+| Decode TP4 | 42.3s | 34.6s | 4.2s |
+
+Both restored processes resumed and re-captured CUDA graphs, but the decode
+TP4 group then failed with a Gloo TCP read timeout
+(`gloo/transport/tcp/pair.cc:537`, `10.0.11.1:3481`). The cause was not the
+snapshot code: node-3's `wall-live` pusher installs
+`-A OUTPUT -s 10.0.11.1/32 -d 10.0.11.1/32 -p tcp -j DROP` (758 packets hit;
+the duplicate `INPUT` copies had 0 hits). Host-network vLLM talks to its own
+host IP for the TP/NIXL bootstrap, so the wall-live drops it. Pinning the
+same-node interfaces to `lo` removes that path; the pair then reaches the
+snapshot gate and captures cleanly.
+
+The post-restore serving check is not yet green: after the source pods were
+force-removed, node-3's kubelet stopped posting status because its local
+`127.0.0.1:6444` API proxy timed out. The restore pods are Pending on the
+NotReady node, so no request has been served after restore. The node needs a
+k3s-agent restart on node-3 (no reboot; prod node-1/node-2 unaffected) before
+the final restore-serving run. Cross-node restore was not attempted: node-4 is
+out of bounds, and a restore on a new node must re-resolve
+`VLLM_NIXL_SIDE_CHANNEL_HOST` to that node's host IP instead of the captured
+loopback value.
