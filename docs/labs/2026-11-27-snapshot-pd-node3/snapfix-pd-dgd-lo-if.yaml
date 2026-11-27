@@ -181,6 +181,8 @@ spec:
             value: /cuda-compat:/usr/local/lib
           - name: VLLM_ENGINE_ITERATION_TIMEOUT_S
             value: "600"
+          - name: TORCHINDUCTOR_CACHE_DIR
+            value: /data/snapfix/cache/torchinductor
           image: localhost/snapfix/dynamo-vllm-placeholder:v1.6.0-cu130
           imagePullPolicy: IfNotPresent
           livenessProbe:
@@ -220,6 +222,10 @@ spec:
           - name: snapshot-cuda
             mountPath: /tmp/snapshot-cuda
             readOnly: true
+          - name: flashinfer-cache
+            mountPath: /root/.cache/flashinfer
+          - name: torchinductor-cache
+            mountPath: /data/snapfix/cache/torchinductor
         dnsPolicy: ClusterFirstWithHostNet
         hostNetwork: true
         imagePullSecrets:
@@ -257,6 +263,14 @@ spec:
             type: Directory
         - name: snapshot-cuda
           emptyDir: {}
+        - name: flashinfer-cache
+          hostPath:
+            path: /data/snapfix/cache/flashinfer
+            type: DirectoryOrCreate
+        - name: torchinductor-cache
+          hostPath:
+            path: /data/snapfix/cache/torchinductor
+            type: DirectoryOrCreate
         securityContext:
           seccompProfile:
             type: Localhost
@@ -375,6 +389,8 @@ spec:
             value: /cuda-compat:/usr/local/lib
           - name: VLLM_ENGINE_ITERATION_TIMEOUT_S
             value: "600"
+          - name: TORCHINDUCTOR_CACHE_DIR
+            value: /data/snapfix/cache/torchinductor
           image: localhost/snapfix/dynamo-vllm-placeholder:v1.6.0-cu130
           imagePullPolicy: IfNotPresent
           livenessProbe:
@@ -414,6 +430,10 @@ spec:
           - name: snapshot-cuda
             mountPath: /tmp/snapshot-cuda
             readOnly: true
+          - name: flashinfer-cache
+            mountPath: /root/.cache/flashinfer
+          - name: torchinductor-cache
+            mountPath: /data/snapfix/cache/torchinductor
         dnsPolicy: ClusterFirstWithHostNet
         hostNetwork: true
         imagePullSecrets:
@@ -451,6 +471,14 @@ spec:
             type: Directory
         - name: snapshot-cuda
           emptyDir: {}
+        - name: flashinfer-cache
+          hostPath:
+            path: /data/snapfix/cache/flashinfer
+            type: DirectoryOrCreate
+        - name: torchinductor-cache
+          hostPath:
+            path: /data/snapfix/cache/torchinductor
+            type: DirectoryOrCreate
         securityContext:
           seccompProfile:
             type: Localhost

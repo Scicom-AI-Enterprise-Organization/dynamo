@@ -18,6 +18,24 @@ from .worker_factory import EngineSetupResult
 logger = logging.getLogger(__name__)
 
 
+def _rebuild_compiled_kernel_state() -> None:
+    """Discard in-process compiled-kernel state after a snapshot restore.
+
+    CRIU restores torch._inductor's CompiledKernel/CachingAutotuner objects
+    with their captured ``inductor_meta``. That metadata still contains the
+    codegen placeholder name (``Placeholder.DESCRIPTIVE_NAME``), so the
+    restored process cannot relaunch those kernels. Clear Dynamo/Inductor's
+    in-process caches so the engine recompiles from source on first use
+    instead of reusing the captured descriptors.
+    """
+    import torch._dynamo
+    import torch._inductor.utils
+
+    torch._dynamo.reset()
+    torch._inductor.utils.clear_caches()
+    logger.info("Cleared Dynamo/Inductor in-process caches after snapshot restore")
+
+
 async def prepare_snapshot_engine(
     config: Config,
     setup_vllm_engine: Callable[[Config], EngineSetupResult],
@@ -48,4 +66,5 @@ async def prepare_snapshot_engine(
     if not await snapshot_controller.wait_for_restore():
         raise SystemExit(0)
 
+    _rebuild_compiled_kernel_state()
     return snapshot_controller

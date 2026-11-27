@@ -1,5 +1,5 @@
 import yaml, copy
-d = yaml.safe_load(open('snapfix-lab/snapfix-pd-dgd.yaml'))
+d = yaml.safe_load(open('snapfix-lab/snapfix-pd-dgd-lo-if.yaml'))
 for c in d['spec']['components']:
     if c['name'] == 'Frontend':
         continue
