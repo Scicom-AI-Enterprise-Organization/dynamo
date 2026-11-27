@@ -1,0 +1,295 @@
+apiVersion: nvidia.com/v1beta1
+kind: DynamoGraphDeployment
+metadata:
+  name: snapfix-agg
+  namespace: snapfix-lab
+spec:
+  backendFramework: vllm
+  env:
+  - name: HF_HOME
+    value: /data/hf
+  - name: HF_HUB_OFFLINE
+    value: '1'
+  - name: OTEL_EXPORT_ENABLED
+    value: 'true'
+  - name: DYN_LOGGING_JSONL
+    value: 'true'
+  - name: OTEL_EXPORTER_OTLP_PROTOCOL
+    value: http/protobuf
+  - name: OTEL_EXPORTER_OTLP_TRACES_PROTOCOL
+    value: http/protobuf
+  - name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+    value: http://victoria-traces.victoria-stack.svc.cluster.local:10428/insert/opentelemetry/v1/traces
+  - name: OTEL_EXPORTER_OTLP_LOGS_ENDPOINT
+    value: http://victoria-logs.victoria-stack.svc.cluster.local:9428/insert/opentelemetry/v1/logs
+  - name: OTEL_TRACES_SAMPLE_RATIO
+    value: '1.0'
+  components:
+  - name: Frontend
+    podTemplate:
+      metadata: {}
+      spec:
+        containers:
+        - env:
+          - name: DYN_ROUTER_MODE
+            value: round-robin
+          - name: DYN_MIGRATION_LIMIT
+            value: '2'
+          - name: DYN_HTTP_GRACEFUL_SHUTDOWN_TIMEOUT_SECS
+            value: '90'
+          - name: DYN_TCP_MAX_MESSAGE_SIZE
+            value: '134217728'
+          - name: DYN_MM_MAX_DATA_URL_MB
+            value: '64'
+          - name: DYN_HTTP_BODY_LIMIT_MB
+            value: '64'
+          - name: OTEL_SERVICE_NAME
+            value: snapfix-agg-frontend
+          - name: DYN_METRICS_ISL_BUCKETS
+            value: 512,1024,2048,4096,8192,16384
+          # The operator injects the bare DGD prefix here, but the worker's
+          # runtime namespace carries the deployment hash suffix. Frontend
+          # discovery only finds endpoints when it matches the worker exactly.
+          - name: DYN_NAMESPACE
+            value: snapfix-lab-snapfix-agg-996d5203
+          image: 865626945255.dkr.ecr.ap-southeast-5.amazonaws.com/scicom/dynamo-vllm-runtime:v1.6.0-nightly-20261016-gemma4-hetero-tp.1-cu130
+          imagePullPolicy: IfNotPresent
+          name: main
+          volumeMounts:
+          - mountPath: /data/hf
+            name: hf-cache
+            readOnly: true
+        imagePullSecrets:
+        - name: regcred
+        nodeSelector:
+          kubernetes.io/hostname: tm-ucc-c3ssfjix-0000
+        terminationGracePeriodSeconds: 100
+        volumes:
+        - hostPath:
+            path: /data/hf
+            type: Directory
+          name: hf-cache
+    replicas: 1
+    runtimeVersionOverride: 1.5.0
+    type: frontend
+  - name: VllmWorker
+    podTemplate:
+      metadata:
+        annotations:
+          nvidia.com/deployment-rolling-update-max-surge: '0'
+          nvidia.com/deployment-rolling-update-max-unavailable: '1'
+          nvidia.com/use-gpuuuid: GPU-8a81b39c-ff3e-f36e-06e4-927977a0e1f7,GPU-979b4fa4-02a3-e0c5-726d-20ec73196cc5,GPU-9f664db9-bdac-5fdc-0bea-1dffdd229e08,GPU-23945d4b-4a48-4ea7-1551-4d10487f294e
+          nvidia.com/restore-from: snapfix-agg-v1
+          nvidia.com/snapshot-target-containers: main
+        labels:
+          nvidia.com/snapshot-checkpoint-id: snapfix-agg
+          snapfix-agg/role: worker
+      spec:
+        containers:
+        - args:
+          - --model
+          - /data/hf/swap/gemma4-31b-fp8/gemma-a
+          - --kv-cache-dtype
+          - auto
+          - --tensor-parallel-size
+          - '4'
+          - --max-model-len
+          - '4096'
+          - --gpu-memory-utilization
+          - '0.06'
+          - --block-size
+          - '64'
+          - --max-num-batched-tokens
+          - '8192'
+          - --max-num-seqs
+          - '16'
+          - --enable-multimodal
+          - --dyn-tool-call-parser
+          - gemma4
+          - --dyn-reasoning-parser
+          - gemma4
+          - --no-enable-prefix-caching
+          - --disable-hybrid-kv-cache-manager
+          - --structured-outputs-config
+          - '{"backend": "xgrammar", "disable_any_whitespace": true}'
+          - --served-model-name
+          - Scicom-intl/gemma-4-31B-it-dpo-repetition-v3.3-handover-v20a-2026-10-27-NVFP4-FP8-attn
+          - --kernel-config
+          - '{"enable_cutedsl_warmup": false}'
+          command:
+          - /tmp/snapshot-cuda/cuinterpose-launch
+          - --library
+          - /tmp/snapshot-cuda/libcuinterpose.so
+          - --
+          - python3
+          - -m
+          - dynamo.vllm
+          env:
+          - name: DYN_NAMESPACE
+            value: snapfix-lab-snapfix-agg
+          - name: VLLM_HOST_IP
+            value: 127.0.0.1
+          - name: GLOO_SOCKET_IFNAME
+            value: lo
+          - name: TP_SOCKET_IFNAME
+            value: lo
+          - name: NCCL_SOCKET_IFNAME
+            value: lo
+          - name: VLLM_ENGINE_ITERATION_TIMEOUT_S
+            value: '600'
+          # The agent preflight requires SNAPSHOT_CONTROL_DIR; the image's
+          # restore_context reads SNAPSHOT_RESTORE_STANDBY (pre-rename), while
+          # current main reads the DYN_-prefixed name. Set all four.
+          - name: SNAPSHOT_CONTROL_DIR
+            value: /snapshot-control
+          - name: DYN_SNAPSHOT_CONTROL_DIR
+            value: /snapshot-control
+          - name: SNAPSHOT_RESTORE_STANDBY
+            value: '1'
+          - name: DYN_SNAPSHOT_RESTORE_STANDBY
+            value: '1'
+          - name: LD_LIBRARY_PATH
+            value: /cuda-compat:/usr/local/nvidia/lib64
+          - name: CUDA_DISABLE_CONTROL
+            value: '1'
+          image: localhost/snapfix/dynamo-vllm-placeholder:v1.6.0-cu130
+          imagePullPolicy: IfNotPresent
+          name: main
+          securityContext:
+            seccompProfile:
+              localhostProfile: profiles/block-iouring.json
+              type: Localhost
+          volumeMounts:
+          - mountPath: /data/hf
+            name: hf-cache
+            readOnly: true
+          - mountPath: /cuda-compat
+            name: cuda-compat
+            readOnly: true
+          - mountPath: /tmp/snapshot-cuda
+            name: snapshot-cuda
+            readOnly: true
+          - mountPath: /dev/shm
+            name: shared-memory
+          - mountPath: /root/.cache/vllm
+            name: vllm-cache
+          - mountPath: /snapshot-control
+            name: snapshot-control
+            subPath: main
+        hostNetwork: true
+        dnsPolicy: ClusterFirstWithHostNet
+        imagePullSecrets:
+        - name: regcred
+        initContainers:
+        - name: snapshot-cuda-install
+          image: ghcr.io/ai-dynamo/snapshot/agent:v0.3.0
+          imagePullPolicy: IfNotPresent
+          command:
+          - /bin/cp
+          args:
+          - --preserve=mode
+          - --
+          - /usr/local/lib/snapshot/libcuinterpose.so
+          - /usr/local/lib/snapshot/libcuinterpose_core.so
+          - /usr/local/bin/cuinterpose-launch
+          - /tmp/snapshot-cuda/
+          volumeMounts:
+          - mountPath: /tmp/snapshot-cuda
+            name: snapshot-cuda
+        # agent v0.3.0's NRI restore proxy becomes PID 1, so the in-process
+        # restore-standby hook never runs and restore-context.json is never
+        # written. Write it here, before the proxy starts, from the pod's own
+        # Downward API identity.
+        - name: restore-context
+          image: localhost/snapfix/dynamo-vllm-placeholder:v1.6.0-cu130
+          imagePullPolicy: IfNotPresent
+          command:
+          - python3
+          - -c
+          - |
+            import json, os, pathlib, re
+            labels = pathlib.Path("/etc/podinfo/labels").read_text()
+            m = re.search(r'nvidia\.com/dynamo-worker-hash="([^"]+)"', labels)
+            if not m:
+                raise SystemExit("dynamo-worker-hash label missing")
+            env = {
+                "DYN_NAMESPACE": os.environ["DYN_NAMESPACE"],
+                "DYN_NAMESPACE_WORKER_SUFFIX": m.group(1),
+                "DYN_COMPONENT": os.environ["DYN_COMPONENT"],
+                "DYN_DISCOVERY_BACKEND": "kubernetes",
+                "DYN_PARENT_DGD_K8S_NAME": os.environ["DYN_PARENT_DGD_K8S_NAME"],
+                "DYN_PARENT_DGD_K8S_NAMESPACE": os.environ["DYN_PARENT_DGD_K8S_NAMESPACE"],
+                "DYN_SYSTEM_PORT": os.environ.get("DYN_SYSTEM_PORT", "9090"),
+                "DYN_SYSTEM_ENABLED": "true",
+                "DYN_HEALTH_CHECK_ENABLED": "true",
+                "POD_NAME": os.environ["POD_NAME"],
+                "POD_NAMESPACE": os.environ["POD_NAMESPACE"],
+                "POD_UID": os.environ["POD_UID"],
+            }
+            out = pathlib.Path("/snapshot-control/restore-context.json")
+            out.write_text(json.dumps({"env": env}, sort_keys=True, separators=(",", ":")) + "\n")
+            print("wrote", out, env["DYN_NAMESPACE"], m.group(1))
+          env:
+          - name: DYN_NAMESPACE
+            value: snapfix-lab-snapfix-agg
+          - name: DYN_COMPONENT
+            value: worker
+          - name: DYN_PARENT_DGD_K8S_NAME
+            value: snapfix-agg
+          - name: DYN_PARENT_DGD_K8S_NAMESPACE
+            value: snapfix-lab
+          - name: DYN_SYSTEM_PORT
+            value: '9090'
+          - name: POD_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+          - name: POD_NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
+          - name: POD_UID
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.uid
+          volumeMounts:
+          - mountPath: /snapshot-control
+            name: snapshot-control
+            subPath: main
+          - mountPath: /etc/podinfo
+            name: podinfo
+            readOnly: true
+        nodeSelector:
+          kubernetes.io/hostname: tm-ucc-c3ssfjix-0000
+        runtimeClassName: nvidia
+        terminationGracePeriodSeconds: 100
+        volumes:
+        - hostPath:
+            path: /data/hf
+            type: Directory
+          name: hf-cache
+        - hostPath:
+            path: /data/snapfix/cuda-compat
+            type: Directory
+          name: cuda-compat
+        - emptyDir: {}
+          name: snapshot-cuda
+        - emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+          name: shared-memory
+        - hostPath:
+            path: /data/snapfix/cache/vllm
+            type: DirectoryOrCreate
+          name: vllm-cache
+        - emptyDir: {}
+          name: snapshot-control
+        - name: podinfo
+          downwardAPI:
+            items:
+            - path: labels
+              fieldRef:
+                fieldPath: metadata.labels
+    replicas: 1
+    runtimeVersionOverride: 1.5.0
+    type: worker

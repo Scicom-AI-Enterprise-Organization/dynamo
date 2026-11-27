@@ -389,3 +389,65 @@ re-register in time; the restore pod starts the app directly, the agent rejects
 it (`the container's PID 1 is ... not /snapshot-control/snapshot-restore-proxy`),
 the restore fails, and the one-shot snapshot is consumed. The v6 run hit
 exactly this; v7 was recaptured after the agent stabilized.
+
+## Aggregated TP4, one engine and one container (2026-11-27, later)
+
+Goal: one vLLM engine doing both prefill and decode, TP4, one container on
+node-3, no separate pair and no NIXL. DGD `snapfix-agg`, model max-len 4096,
+gpu-memory-utilization 0.06, max-num-batched-tokens 8192, max-num-seqs 16,
+cuinterpose, `nvidia.com/snapshot-multi-gpu: enabled`.
+
+| Phase | Result |
+|---|---|
+| Cold start to `ready-for-snapshot` | 2m40s (warm caches); 6m30s on the first run |
+| Capture `snapfix-agg-v1` | 1m55.0s total: CRIU 45.0s, CUDA 17.3s, publish/switch 51.7s |
+| Restore | 42.6s total: CRIU 34.2s, CUDA 7.4s, overlay 0.4s |
+| Registration after restore | ~0.3s after "External restore completed" |
+| Frontend discovery | 3 endpoints (`generate`, `clear_kv_blocks`, `get_perf_metrics`) under `snapfix-lab-snapfix-agg-996d5203` |
+| TTFT after restore, 6,360-char prompt, 8 max tokens | 118 / 120 / 120 / 118 / 119 ms (first request 208 ms) |
+
+No VMA plugin (stock `/usr/local/lib/snapshot/criu-plugins`), no `a94bd0a`
+hook, `mntnsCompatMode: true`, and no kernel rebuild. The mount-v2 sharing
+error does not reproduce in this configuration: `mntnsCompatMode` is the
+workaround that makes the multi-GPU restore work.
+
+There is no pre-capture TTFT for this shape: the engine deliberately pauses at
+the `ready-for-snapshot` gate before the Dynamo runtime registers, so it never
+serves cold. The meaningful comparison is cold start to gate (2m40s) versus
+restore (42.6s), and the restored engine serves at the numbers above.
+
+### Blockers found and fixed
+
+1. Agent v0.3.0 preflight requires the cuinterpose delivery mount
+   `/tmp/snapshot-cuda` to be **read-only** in the application container; the
+   init container still writes it. Capture fails immediately otherwise:
+   `cuinterpose delivery mount /tmp/snapshot-cuda must be read-only`.
+2. The agent requires `/snapshot-control` to be mounted with `subPath: main`,
+   otherwise every restore pod is rejected with `requires volume
+   "snapshot-control" mounted at /snapshot-control with subPath "main"` and the
+   ReplicaSet recreates it in a hot loop.
+3. The agent preflight also requires a `SNAPSHOT_CONTROL_DIR` environment
+   variable, in addition to `DYN_SNAPSHOT_CONTROL_DIR`.
+4. The image's restore-standby code reads `SNAPSHOT_RESTORE_STANDBY`, not the
+   `DYN_SNAPSHOT_RESTORE_STANDBY` that current main and the lab values use. In
+   any case agent v0.3.0's NRI restore proxy becomes PID 1, so the in-process
+   standby hook never runs and `restore-context.json` is never written; the
+   restored process then dies in `apply_snapshot_restore_env`. Workaround: a
+   `restore-context` init container writes the file before the proxy starts,
+   using the pod's Downward API identity and the
+   `nvidia.com/dynamo-worker-hash` label so the namespace suffix stays correct
+   across rollouts.
+5. Discovery needs the frontend `DYN_NAMESPACE` set to the worker's full
+   runtime namespace (`snapfix-lab-snapfix-agg-<worker-hash>`). The operator
+   injects only the bare DGD prefix into the frontend. The hash changes with
+   every pod-template change, so set it after each rollout and never between
+   capture and restore.
+6. The `wall-live` DaemonSet re-adds loopback `DROP` rules on node-3 (58 per
+   chain in INPUT and OUTPUT). Kubelet then cannot reach `127.0.0.1:6444` and
+   the node goes `NotReady`, which blocks restore scheduling and leaves the old
+   pod terminating. Deleting only the `127.0.0.1`/`10.0.11.1` self-DROP rules
+   restores the node without a service restart; check for them before each
+   capture and restore.
+7. The abandoned `snapfix-pd` DGD was still reconciling and spawning pods,
+   competing for node-3 GPUs and the declared host port. Deleting that DGD and
+   its pods was required before the aggregated restore could schedule.

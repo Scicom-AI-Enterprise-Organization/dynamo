@@ -28,7 +28,7 @@ config:
   criu:
     logLevel: 2
     mntnsCompatMode: true
-    libDir: /usr/local/lib/criu
+    libDir: /usr/local/lib/snapshot/criu-plugins
 pageBroker:
   staging:
     sizeLimit: 192Gi
